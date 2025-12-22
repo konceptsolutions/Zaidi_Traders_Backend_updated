@@ -428,10 +428,36 @@ class ItemInventoryController extends Controller
 
     public function disposeExpiredStock(Request $request)
     {
-        $item_id = $request->item_id;
         try {
             DB::transaction(function () use ($request) {
+                $itemId = $request->item_id;
+                $disposedQuantity = (float) $request->quantity;
 
+                // Get item and current avg_cost BEFORE disposal
+                $item = Item::find($itemId);
+                if (!$item) {
+                    throw new \Exception('Item not found');
+                }
+
+                // Store avg_cost before disposal for voucher
+                $avgCostBeforeDisposal = $item->avg_cost;
+
+                // Get current stock BEFORE disposal (ItemInventory record not created yet)
+                $currentStock = Item::calculateTotalStockQty($itemId);
+
+                // Calculate total amount before disposal using avg_cost
+                // Always use avg_cost * currentStock because avg_cost is the weighted average
+                // that accounts for all purchases, sales, and returns
+                if ($currentStock > 0 && $item->avg_cost > 0) {
+                    $totalAmountBeforeDisposal = $item->avg_cost * $currentStock;
+                } else {
+                    $totalAmountBeforeDisposal = 0;
+                }
+
+                // Calculate disposed amount at current avg_cost
+                $disposedAmount = $item->avg_cost * $disposedQuantity;
+
+                // Create ItemInventory record for disposal
                 $disposestock = new ItemInventory();
                 $disposestock->inventory_type_id = 6;
                 $disposestock->item_id = $request->item_id;
@@ -440,15 +466,30 @@ class ItemInventoryController extends Controller
                 $disposestock->quantity_out = $request->quantity;
                 $disposestock->expiry_date = $request->expiry_date;
                 $disposestock->date = date('y-m-d');
-                $disposestock->is_dummy  = 0;
+                $disposestock->is_dummy = 0;
                 $disposestock->save();
-                $itemId = $request->item_id;
-                $averagePrice = PurchaseOrderChild::getStoredAveragePrice($itemId);
+
+                // Calculate new stock and total amount after disposal
+                $newStockQty = $currentStock - $disposedQuantity;
+                $newTotalAmount = $totalAmountBeforeDisposal - $disposedAmount;
+
+                // Calculate new average cost
+                if ($newStockQty > 0) {
+                    $newAvgCost = $newTotalAmount / $newStockQty;
+                } else {
+                    $newAvgCost = 0;
+                }
+
+                // Update the item's average cost
+                $item->avg_cost = $newAvgCost;
+                $item->save();
+
+                // Get item details for voucher
                 $itemname = Item::where('id', $itemId)->value('name');
                 $manudacturer = Person::where('id', $request->manufacture_id)->value('name');
 
-                //voucher for dispose
-                $this->VoucherForDisposedStock($request, $averagePrice, $itemname, $itemId, $manudacturer);
+                // Voucher for dispose (use the avg_cost before disposal for the transaction)
+                $this->VoucherForDisposedStock($request, $avgCostBeforeDisposal, $itemname, $itemId, $manudacturer);
             });
             return ['status' => "ok", 'message' => 'Inventory disposed successfully'];
         } catch (\Exception $e) {
@@ -497,7 +538,7 @@ class ItemInventoryController extends Controller
         $voucherTransaction = new VoucherTransaction();
         $voucherTransaction->voucher_id = $voucher_id;
         $voucherTransaction->date = $request->request_date;
-        $voucherTransaction->coa_account_id = 7;
+        $voucherTransaction->coa_account_id = 1778;
         $voucherTransaction->debit = ($request->quantity) * ($averagePrice);
         $voucherTransaction->credit = 0;
         $voucherTransaction->is_approved = 1;

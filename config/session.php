@@ -128,7 +128,7 @@ return [
 
     'cookie' => env(
         'SESSION_COOKIE',
-        Str::slug(env('APP_NAME', 'laravel'), '_').'_session'
+        Str::slug(env('APP_NAME', 'laravel'), '_').'_'.substr(md5((env('APP_URL') ?: base_path()).(env('DB_DATABASE') ?: '')), 0, 12).'_session'
     ),
 
     /*

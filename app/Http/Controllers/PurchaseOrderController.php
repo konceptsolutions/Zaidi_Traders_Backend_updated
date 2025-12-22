@@ -601,57 +601,6 @@ class PurchaseOrderController extends Controller
                 }
             }
 
-            // Group items by item_id for average cost calculation
-            $groupedItems = [];
-            foreach ($request->childArray as $row) {
-                $itemId = $row['item_id'];
-                if (!isset($groupedItems[$itemId])) {
-                    $groupedItems[$itemId] = [
-                        'quantity' => 0,
-                        'total' => 0,
-                    ];
-                }
-
-                $groupedItems[$itemId]['quantity'] += (float) $row['received_quantity'];
-                $groupedItems[$itemId]['total'] += (float) $row['amount'];
-            }
-
-            // Calculate average cost for grouped items
-            foreach ($groupedItems as $itemId => $data) {
-                // Get old totals from existing PO (if it was already received)
-                $totalSumPurchaseOrder = PurchaseOrderChild::join('purchase_orders', 'purchase_orders.id', '=', 'purchase_order_children.purchase_order_id')
-                    ->where('purchase_order_children.item_id', $itemId)
-                    ->where('purchase_orders.id', $request->id)
-                    ->where('purchase_orders.is_received', 1)
-                    ->sum('purchase_order_children.total');
-
-                $totalQtyPurchaseOrder = PurchaseOrderChild::join('purchase_orders', 'purchase_orders.id', '=', 'purchase_order_children.purchase_order_id')
-                    ->where('purchase_order_children.item_id', $itemId)
-                    ->where('purchase_orders.id', $request->id)
-                    ->where('purchase_orders.is_received', 1)
-                    ->sum('purchase_order_children.received_quantity');
-
-                // Get current item
-                $item = Item::find($itemId);
-                $currentStock = Item::calculateTotalStockQty($itemId);
-                $currentTotalAmount = $item->avg_cost * $currentStock;
-
-                // Calculate new stock and total cost (reverse old PO totals, add new ones)
-                $newStockQty = $currentStock + $data['quantity'] - $totalQtyPurchaseOrder;
-                $newTotalAmount = $currentTotalAmount + $data['total'] - $totalSumPurchaseOrder;
-
-                // Calculate new average cost
-                if ($newStockQty > 0) {
-                    $newAvgCost = $newTotalAmount / $newStockQty;
-                } else {
-                    $newAvgCost = 0;
-                }
-
-                // Update the item's average cost
-                $item->avg_cost = $newAvgCost;
-                $item->save();
-            }
-
             // Process individual items
             foreach ($request->childArray as $row) {
                 if ($request->po_type == 1) {
@@ -902,6 +851,8 @@ class PurchaseOrderController extends Controller
             $purchaseorder->remarks = $request->remarks;
             $purchaseorder->is_received = 1;
             $purchaseorder->is_approved = 1;
+            // Direct purchase orders should always be treated as completed
+            $purchaseorder->is_completed = 1;
             $purchaseorder->total = $request->total;
             $purchaseorder->discount = $request->discount;
             $purchaseorder->tax = $request->tax;
@@ -1574,9 +1525,87 @@ class PurchaseOrderController extends Controller
 
             // if ($request->is_pending == 0) {
             $purchaseorder = PurchaseOrder::find($request->id);
+             if ($purchaseorder->is_completed == 1) {
+                throw new \Exception('Po is already completed');
+            }
+
+            // Get purchase order children for average cost calculation
+            $poChildren = PurchaseOrderChild::where('purchase_order_id', $request->id)->get();
+            
+            // Group items by item_id for average cost calculation
+            $groupedItems = [];
+            foreach ($poChildren as $child) {
+                $itemId = $child->item_id;
+                if (!isset($groupedItems[$itemId])) {
+                    $groupedItems[$itemId] = [
+                        'quantity' => 0,
+                        'total' => 0,
+                    ];
+                }
+
+                $groupedItems[$itemId]['quantity'] += (float) $child->received_quantity;
+                $groupedItems[$itemId]['total'] += (float) $child->total;
+            }
+
+            // Calculate average cost for grouped items
+            foreach ($groupedItems as $itemId => $data) {
+                // Get old totals from existing PO if it was already completed
+                $totalSumPurchaseOrder = PurchaseOrderChild::join('purchase_orders', 'purchase_orders.id', '=', 'purchase_order_children.purchase_order_id')
+                    ->where('purchase_order_children.item_id', $itemId)
+                    ->where('purchase_orders.id', $request->id)
+                    ->where('purchase_orders.is_completed', 1)
+                    ->sum('purchase_order_children.total');
+
+                $totalQtyPurchaseOrder = PurchaseOrderChild::join('purchase_orders', 'purchase_orders.id', '=', 'purchase_order_children.purchase_order_id')
+                    ->where('purchase_order_children.item_id', $itemId)
+                    ->where('purchase_orders.id', $request->id)
+                    ->where('purchase_orders.is_completed', 1)
+                    ->sum('purchase_order_children.received_quantity');
+
+                // Get current item
+                $item = Item::find($itemId);
+                
+                // Get current stock (includes this PO's items since receivePurchaseOrder was called)
+                $currentStockWithThisPO = Item::calculateTotalStockQty($itemId);
+                
+                // Calculate stock before this PO completion
+                // Subtract this PO's quantity and add back old completed quantity (if any)
+                $currentStock = $currentStockWithThisPO - $data['quantity'] + $totalQtyPurchaseOrder;
+                
+                // For average costing, use avg_cost * stock before this PO
+                // This is the correct approach because avg_cost represents the weighted average
+                // of all completed purchases
+                $currentTotalAmount = $item->avg_cost * $currentStock;
+                
+                // Calculate stock and value BEFORE this PO was completed
+                $stockBeforeThisPO = $currentStock + $totalQtyPurchaseOrder;
+                $totalAmountBeforeThisPO = $currentTotalAmount + $totalSumPurchaseOrder;
+
+                // Calculate new stock and total amount
+                if ($totalQtyPurchaseOrder > 0) {
+                    // PO was completed before, so we need to reverse the old completed PO and add the new one
+                    $newStockQty = $stockBeforeThisPO + $data['quantity'] - $totalQtyPurchaseOrder;
+                    $newTotalAmount = $totalAmountBeforeThisPO + $data['total'] - $totalSumPurchaseOrder;
+                } else {
+                    // First time completing this PO
+                    $newStockQty = $currentStock + $data['quantity'];
+                    $newTotalAmount = $currentTotalAmount + $data['total'];
+                }
+
+                // Calculate new average cost
+                if ($newStockQty > 0) {
+                    $newAvgCost = $newTotalAmount / $newStockQty;
+                } else {
+                    $newAvgCost = 0;
+                }
+
+                // Update the item's average cost
+                $item->avg_cost = $newAvgCost;
+                $item->save();
+            }
 
             // Always create voucher/transactions regardless of current completion flag
-            // $purchaseorder->is_completed = '1';
+            $purchaseorder->is_completed = '1';
             $purchaseorder->is_received = '1';
             $purchaseorder->save();
             $purchaseorder->po_no;

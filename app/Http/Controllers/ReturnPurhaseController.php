@@ -180,6 +180,56 @@ class ReturnPurhaseController extends Controller
             }
             DB::transaction(function () use ($request) {
 
+                // Group items by item_id for average cost calculation
+                $groupedItems = [];
+                foreach ($request->childArray as $row) {
+                    $itemId = $row['item_id'];
+                    if (!isset($groupedItems[$itemId])) {
+                        $groupedItems[$itemId] = [
+                            'quantity' => 0,
+                            'total' => 0,
+                        ];
+                    }
+
+                    $groupedItems[$itemId]['quantity'] += (float) $row['quantity'];
+                    $groupedItems[$itemId]['total'] += (float) $row['amount'];
+                }
+
+                // Calculate average cost for grouped items (before creating ItemInventory records)
+                foreach ($groupedItems as $itemId => $data) {
+                    // Get current item
+                    $item = Item::find($itemId);
+                    
+                    // Get current stock BEFORE return (ItemInventory records not created yet)
+                    $currentStock = Item::calculateTotalStockQty($itemId);
+                    
+                    // Calculate total amount before return using avg_cost
+                    // Always use avg_cost * currentStock because avg_cost is the weighted average
+                    // that accounts for all purchases, sales, and returns. Using individual purchase_price
+                    // from ItemInventory is incorrect when items have been sold via sale invoices.
+                    if ($currentStock > 0 && $item->avg_cost > 0) {
+                        $totalAmountBeforeReturn = $item->avg_cost * $currentStock;
+                    } else {
+                        // No existing stock or value
+                        $totalAmountBeforeReturn = 0;
+                    }
+
+                    // Calculate new stock and total amount after return (subtract return quantity and amount)
+                    $newStockQty = $currentStock - $data['quantity'];
+                    $newTotalAmount = $totalAmountBeforeReturn - $data['total'];
+
+                    // Calculate new average cost
+                    if ($newStockQty > 0) {
+                        $newAvgCost = $newTotalAmount / $newStockQty;
+                    } else {
+                        $newAvgCost = 0;
+                    }
+
+                    // Update the item's average cost
+                    $item->avg_cost = $newAvgCost;
+                    $item->save();
+                }
+
                 $purchaseorder = new ReturnPurchaseOrder();
                 $purchaseorder->po_id    = $request->id;
                 $purchaseorder->return_date    = $request->return_date;
@@ -225,7 +275,11 @@ class ReturnPurhaseController extends Controller
                     $itemInventory->item_id = $row['item_id'];
                     $itemInventory->manufacture_id = $row['manufacturer_id'];
                     $itemInventory->expiry_date = $row['expiry_date'];
-                    $itemInventory->inventory_type_id = 5;
+                    if ($request->po_type == 3) {
+                        $itemInventory->inventory_type_id = 9;
+                    } elseif ($request->po_type == 1) {
+                        $itemInventory->inventory_type_id = 5;
+                    }
                     $itemInventory->quantity_out = $row['quantity'];
                     $itemInventory->purchase_price = $row['rate'];
                     $itemInventory->date = date('Y-m-d');
@@ -760,34 +814,79 @@ class ReturnPurhaseController extends Controller
 
             DB::transaction(function () use ($request) {
                 $poid = $request->id;
-                $ItemInventory = ReturnPurchaseOrderChild::where('ret_purchase_order_id', $poid)->select('id')->get();
+                
+                // Get return PO children before deleting
+                $returnPoChildren = ReturnPurchaseOrderChild::where('ret_purchase_order_id', $poid)->get();
 
+                // Group items by item_id for average cost calculation
+                $groupedItems = [];
+                foreach ($returnPoChildren as $item) {
+                    $itemId = $item->item_id;
+                    if (!isset($groupedItems[$itemId])) {
+                        $groupedItems[$itemId] = [
+                            'quantity' => 0,
+                            'total' => 0,
+                        ];
+                    }
 
-                if ($ItemInventory) {
-                    foreach ($ItemInventory as  $ItemInventorys) {
+                    $groupedItems[$itemId]['quantity'] += (float) $item->quantity;
+                    $groupedItems[$itemId]['total'] += (float) $item->total;
+                }
+
+                // Calculate average cost BEFORE deleting ItemInventory records
+                // We need to get the current state (with return still in inventory as quantity_out)
+                foreach ($groupedItems as $itemId => $data) {
+                    // Get current item
+                    $item = Item::find($itemId);
+                    
+                    // Get current stock BEFORE ItemInventory deletion (still includes quantity_out from return)
+                    $currentStock = Item::calculateTotalStockQty($itemId);
+                    
+                    // Calculate total amount using current avg_cost and stock
+                    // This is the correct approach for average costing
+                    $currentTotalAmount = $item->avg_cost * $currentStock;
+
+                    // Calculate new stock and total amount (add back the return quantity and amount)
+                    // After deleting ItemInventory, stock will increase by return quantity
+                    // So new stock = current stock (with return) + return quantity = stock before return
+                    $newStockQty = $currentStock + $data['quantity'];
+                    // New total amount = current amount + return amount = amount before return
+                    $newTotalAmount = $currentTotalAmount + $data['total'];
+
+                    // Calculate new average cost
+                    if ($newStockQty > 0) {
+                        $newAvgCost = $newTotalAmount / $newStockQty;
+                    } else {
+                        $newAvgCost = 0;
+                    }
+
+                    // Update the item's average cost
+                    $item->avg_cost = $newAvgCost;
+                    $item->save();
+                }
+
+                // Delete ItemInventory records (this removes quantity_out entries)
+                if ($returnPoChildren) {
+                    foreach ($returnPoChildren as $ItemInventorys) {
                         ItemInventory::where('return_po_id', $ItemInventorys->id)->delete();
                     }
                 }
+
+                // Delete return PO children and parent
                 ReturnPurchaseOrderChild::where(['ret_purchase_order_id' => $request->id])->delete();
                 $parentDelete = ReturnPurchaseOrder::where(['id' => $request->id])->delete();
 
+                // Delete vouchers
                 $voucher = Voucher::where('return_po_id', $request->id)->select('id')->get();
 
                 if (count($voucher) > 0) {
-
-                    foreach ($voucher as  $voucher) {
+                    foreach ($voucher as $voucher) {
                         Voucher::where('id', $voucher->id)->delete();
                         VoucherTransaction::where('voucher_id', $voucher->id)->delete();
                     }
                 } else {
                     throw new \Exception('Voucher Not Found');
                 }
-
-
-                //  $ItemInventory = ItemInventory::with('invoicechild')->whereHas('invoicechild', function ($query) use ($poid) {
-                //     $query->where('invoice_id', $invno);
-                // })->get();
-
             });
 
             return ['status' => 'ok', 'message' => 'Invoice Deleted Successfully'];

@@ -1199,8 +1199,80 @@ class InvoiceController extends Controller
             $creditside = 0;
             $totalAvgPrice = 0;
             $price = 0;
+            
+            // Get old invoice children before deleting
+            $oldInvoiceChildren = InvoiceChild::where('invoice_id', $request->id)->get();
+            
+            // Group old invoice items by item_id for average cost calculation
+            $oldGroupedItems = [];
+            foreach ($oldInvoiceChildren as $child) {
+                $itemId = $child->item_id;
+                if (!isset($oldGroupedItems[$itemId])) {
+                    $oldGroupedItems[$itemId] = [
+                        'quantity' => 0,
+                        'total' => 0,
+                    ];
+                }
+                $oldGroupedItems[$itemId]['quantity'] += (float) $child->quantity;
+                $oldGroupedItems[$itemId]['total'] += (float) ($child->cost * $child->quantity);
+            }
+            
+            // Group new invoice items by item_id
+            $newGroupedItems = [];
+            foreach ($request->childArray as $row) {
+                $itemId = $row['item_id'];
+                if (!isset($newGroupedItems[$itemId])) {
+                    $newGroupedItems[$itemId] = [
+                        'quantity' => 0,
+                        'total' => 0,
+                    ];
+                }
+                $newGroupedItems[$itemId]['quantity'] += (float) $row['quantity'];
+                $newGroupedItems[$itemId]['total'] += (float) ($row['avg_price'] * $row['quantity']);
+            }
+            
+            // Calculate average cost BEFORE deleting ItemInventory records
+            // We need to reverse the old sale and apply the new sale
+            $allItemIds = array_unique(array_merge(array_keys($oldGroupedItems), array_keys($newGroupedItems)));
+            
+            foreach ($allItemIds as $itemId) {
+                $item = Item::find($itemId);
+                if (!$item) {
+                    continue;
+                }
+                
+                // Get current stock BEFORE ItemInventory deletion (still includes quantity_out from old invoice)
+                $currentStock = Item::calculateTotalStockQty($itemId);
+                
+                // Calculate total amount using current avg_cost and stock
+                $currentTotalAmount = $item->avg_cost * $currentStock;
+                
+                // Get old and new quantities and amounts
+                $oldQuantity = $oldGroupedItems[$itemId]['quantity'] ?? 0;
+                $oldTotal = $oldGroupedItems[$itemId]['total'] ?? 0;
+                $newQuantity = $newGroupedItems[$itemId]['quantity'] ?? 0;
+                $newTotal = $newGroupedItems[$itemId]['total'] ?? 0;
+                
+                // Reverse old sale (add back) and apply new sale (subtract)
+                // After deleting ItemInventory, stock will increase by old quantity
+                // Then we subtract new quantity
+                $newStockQty = $currentStock + $oldQuantity - $newQuantity;
+                $newTotalAmount = $currentTotalAmount + $oldTotal - $newTotal;
+                
+                // Calculate new average cost
+                if ($newStockQty > 0) {
+                    $newAvgCost = $newTotalAmount / $newStockQty;
+                } else {
+                    $newAvgCost = 0;
+                }
+                
+                // Update the item's average cost
+                $item->avg_cost = $newAvgCost;
+                $item->save();
+            }
+            
+            // Delete old ItemInventory records (this removes quantity_out entries, adding stock back)
             $ItemInventory = InvoiceChild::where('invoice_id', $request->id)->select('id')->get();
-
             if ($ItemInventory) {
                 foreach ($ItemInventory as $ItemInventory) {
                     ItemInventory::where('invoice_id', $ItemInventory->id)->delete();
@@ -1871,17 +1943,68 @@ class InvoiceController extends Controller
                 }
                 // End
 
-                //  $ItemInventory = ItemInventory::with('invoicechild')->whereHas('invoicechild', function ($query) use ($invno) {
-                //     $query->where('invoice_id', $invno);
-                // })->get();
+                // Get invoice children before deleting
+                $invoiceChildren = InvoiceChild::where('invoice_id', $invno)->get();
 
+                // Group items by item_id for average cost calculation
+                $groupedItems = [];
+                foreach ($invoiceChildren as $child) {
+                    $itemId = $child->item_id;
+                    if (!isset($groupedItems[$itemId])) {
+                        $groupedItems[$itemId] = [
+                            'quantity' => 0,
+                            'total' => 0,
+                        ];
+                    }
+
+                    $groupedItems[$itemId]['quantity'] += (float) $child->quantity;
+                    $groupedItems[$itemId]['total'] += (float) ($child->cost * $child->quantity);
+                }
+
+                // Calculate average cost BEFORE deleting ItemInventory records
+                // We need to reverse the sale by adding back the sold quantity and cost
+                foreach ($groupedItems as $itemId => $data) {
+                    // Get current item
+                    $item = Item::find($itemId);
+                    if (!$item) {
+                        continue;
+                    }
+                    
+                    // Get current stock BEFORE ItemInventory deletion (still includes quantity_out from invoice)
+                    $currentStock = Item::calculateTotalStockQty($itemId);
+                    
+                    // Calculate total amount using current avg_cost and stock
+                    // This is the correct approach for average costing
+                    $currentTotalAmount = $item->avg_cost * $currentStock;
+
+                    // Calculate new stock and total amount (add back the sold quantity and cost)
+                    // After deleting ItemInventory, stock will increase by sold quantity
+                    // So new stock = current stock (with sale) + sold quantity = stock before sale
+                    $newStockQty = $currentStock + $data['quantity'];
+                    // New total amount = current amount + sold cost = amount before sale
+                    $newTotalAmount = $currentTotalAmount + $data['total'];
+
+                    // Calculate new average cost
+                    if ($newStockQty > 0) {
+                        $newAvgCost = $newTotalAmount / $newStockQty;
+                    } else {
+                        $newAvgCost = 0;
+                    }
+
+                    // Update the item's average cost
+                    $item->avg_cost = $newAvgCost;
+                    $item->save();
+                }
+
+                // Delete ItemInventory records (this removes quantity_out entries, adding stock back)
                 $ItemInventory = InvoiceChild::where('invoice_id', $invno)->select('id')->get();
-
                 if ($ItemInventory) {
                     foreach ($ItemInventory as $ItemInventory) {
                         ItemInventory::where('invoice_id', $ItemInventory->id)->delete();
                     }
                 }
+                
+                // Delete invoice children and parent
                 InvoiceChild::where(['invoice_id' => $request->id])->delete();
                 $parentDelete = Invoice::where(['id' => $request->id])->delete();
 

@@ -7,6 +7,7 @@ use App\Models\CoaAccount;
 use App\Models\Invoice;
 use App\Models\InvoiceChild;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
 use App\Models\InvoiceReturn;
 use App\Models\InvoiceChildReturn;
 use App\Models\Item;
@@ -167,6 +168,8 @@ class InvoiceReturnController extends Controller
             return ['status' => 'error', 'message' => $validator->errors()->first()];
         }
         try {
+            $debugAvgCost = (int) ($request->debug_avg_cost ?? 0) === 1;
+            $avgCostDebug = [];
             // if ($request->amount_received  + $request->bank_amount_received != $request->total_after_gst && $request->sale_type == 1) {
             //     return ['status' => 'error', 'message' => "Total amount must be received"];
             // }
@@ -207,7 +210,173 @@ class InvoiceReturnController extends Controller
             }
             // return ['status' => 'error', 'message' => "1Return quantity is greater than qty available for return: " . $row['sold_quantity'] - $return_qty];
 
-            DB::transaction(function () use ($request) {
+            DB::transaction(function () use ($request, $debugAvgCost, &$avgCostDebug) {
+                // IMPORTANT:
+                // Avg-cost update must be inside the same transaction as the rest of the return creation.
+                // If anything fails later, the avg_cost update will rollback too.
+
+                // Group items by item_id for average cost calculation
+                // We need to get the cost from the original invoice (at time of sale)
+                // IMPORTANT: Match each return row to its specific InvoiceChild record using batch details
+                $groupedItems = [];
+                foreach ($request->childArray as $row) {
+                    $itemId = $row['item_id'];
+                    // Return quantity:
+                    // In THIS module, frontend sends return quantity in `quantity`.
+                    // Only fall back to `returned_qty` if `quantity` is missing/non-numeric.
+                    $qtyFromQuantity = is_numeric($row['quantity'] ?? null) ? (float) $row['quantity'] : null;
+                    $qtyFromReturned = is_numeric($row['returned_qty'] ?? null) ? (float) $row['returned_qty'] : null;
+                    $returnQty = $qtyFromQuantity ?? $qtyFromReturned ?? 0.0;
+                    
+                    // Get the original invoice child to get the exact cost at time of sale
+                    // The cost field in InvoiceChild stores the avg_cost that was used when the item was sold
+                    // We need to match the specific InvoiceChild record for this batch
+                    // ItemInventory->invoice_id points to InvoiceChild->id (not Invoice->id)
+                    $invoiceChild = null;
+                    
+                    // First, try to find the InvoiceChild via ItemInventory using batch details
+                    if (isset($row['batchDetails'])) {
+                        // Same batch can be sold in multiple invoices over time.
+                        // So we must restrict ItemInventory rows to those whose linked InvoiceChild belongs to THIS invoice.
+                        $itemInventory = ItemInventory::whereNotNull('invoice_id')
+                            ->where('item_id', $itemId)
+                            ->where('batch_no', $row['batchDetails']['batch_no'])
+                            ->where('manufacture_id', $row['batchDetails']['manufacturer_id'])
+                            ->where('expiry_date', $row['batchDetails']['batchExpiry'])
+                            ->whereHas('invoicechild', function ($q) use ($request) {
+                                $q->where('invoice_id', $request->id);
+                            })
+                            ->with('invoicechild')
+                            ->orderByDesc('id')
+                            ->first();
+
+                        if ($itemInventory && $itemInventory->invoicechild) {
+                            $invoiceChild = $itemInventory->invoicechild;
+                        }
+                    }
+                    
+                    // Fallback: if not found via ItemInventory, try direct lookup
+                    if (!$invoiceChild) {
+                        $invoiceChild = InvoiceChild::where('invoice_id', $request->id)
+                            ->where('item_id', $itemId)
+                            ->first();
+                    }
+                    
+                    // Cost-at-sale to add back on return:
+                    // Prefer the frontend-provided avg_price (it is taken from InvoiceChild->cost at time of sale).
+                    // Fallback to InvoiceChild->cost lookup only if avg_price is missing/non-numeric.
+                    $costSource = 'request.avg_price';
+                    if (is_numeric($row['avg_price'] ?? null)) {
+                        $costAtSale = (float) $row['avg_price'];
+                    } elseif ($invoiceChild) {
+                        $rawCost = DB::table('invoice_children')
+                            ->where('id', $invoiceChild->id)
+                            ->value('cost');
+                        $costAtSale = is_numeric($rawCost) ? (float) $rawCost : 0.0;
+                        $costSource = 'invoice_children.cost';
+                    } else {
+                        $costAtSale = 0.0;
+                        $costSource = 'none';
+                    }
+                    
+                    if (!isset($groupedItems[$itemId])) {
+                        $groupedItems[$itemId] = [
+                            'quantity' => 0,
+                            'total' => 0,
+                            'debug_rows' => [],
+                        ];
+                    }
+
+                    $groupedItems[$itemId]['quantity'] += $returnQty;
+                    $groupedItems[$itemId]['total'] += (float) ($costAtSale * $returnQty);
+
+                    if ($debugAvgCost) {
+                        $groupedItems[$itemId]['debug_rows'][] = [
+                            'qty' => $returnQty,
+                            'qty_source' => $qtyFromQuantity !== null ? 'quantity' : ($qtyFromReturned !== null ? 'returned_qty' : 'none'),
+                            'batch_no' => $row['batchDetails']['batch_no'] ?? null,
+                            'manufacture_id' => $row['batchDetails']['manufacturer_id'] ?? null,
+                            'expiry_date' => $row['batchDetails']['batchExpiry'] ?? null,
+                            'matched_invoice_child_id' => $invoiceChild ? $invoiceChild->id : null,
+                            'cost_source' => $costSource,
+                            'cost_at_sale' => (float) $costAtSale,
+                        ];
+                    }
+                }
+
+                // Calculate average cost for grouped items (before creating ItemInventory records)
+                foreach ($groupedItems as $itemId => $data) {
+                    $item = Item::find($itemId);
+                    if (!$item) {
+                        continue;
+                    }
+                    
+                    // Stock BEFORE return (return inventory not created yet)
+                    $currentStock = Item::calculateTotalStockQty($itemId);
+
+                    // Also compute store-wise stock for debugging (some screens show store stock)
+                    $date = date('y-m-d');
+                    $storeStock = null;
+                    if (!empty($request->store_id)) {
+                        $storeStockRow = ItemInventory::where('is_dummy', 0)
+                            ->where('item_id', $itemId)
+                            ->where('store_id', $request->store_id)
+                            ->where('expiry_date', '>', $date)
+                            ->select(DB::raw('SUM(quantity_in) - SUM(quantity_out) as qty'))
+                            ->first();
+                        $storeStock = $storeStockRow ? (float) $storeStockRow->qty : 0.0;
+                    }
+                    
+                    $rawAvgCost = DB::table('items')
+                        ->where('id', $itemId)
+                        ->value('avg_cost');
+                    $currentAvgCost = is_numeric($rawAvgCost) ? (float) $rawAvgCost : 0;
+                    
+                    $currentTotalAmount = $currentAvgCost * $currentStock;
+                    $newStockQty = $currentStock + $data['quantity'];
+                    $newTotalAmount = $currentTotalAmount + $data['total'];
+                    $newAvgCost = $newStockQty > 0 ? ($newTotalAmount / $newStockQty) : 0;
+
+                    if ($debugAvgCost) {
+                        Log::error('InvoiceReturn avg_cost calc', [
+                            'invoice_id' => $request->id,
+                            'item_id' => $itemId,
+                            'current_stock' => $currentStock,
+                            'store_stock' => $storeStock,
+                            'current_avg_cost_raw' => $rawAvgCost,
+                            'current_total_amount' => $currentTotalAmount,
+                            'return_qty' => $data['quantity'],
+                            'return_total' => $data['total'],
+                            'new_stock' => $newStockQty,
+                            'new_total_amount' => $newTotalAmount,
+                            'new_avg_cost' => $newAvgCost,
+                        ]);
+                    }
+
+                    // Update avg_cost inside transaction (rolls back on error)
+                    $item->avg_cost = $newAvgCost;
+                    $item->save();
+
+                    if ($debugAvgCost) {
+                        $avgCostDebug[$itemId] = [
+                            'invoice_id' => $request->id,
+                            'item_id' => $itemId,
+                            'current_stock_before_return' => (float) $currentStock,
+                            'current_avg_cost_before_return' => (float) $currentAvgCost,
+                            'current_stock_global' => (float) $currentStock,
+                            'current_stock_store' => $storeStock,
+                            'current_avg_cost_raw' => $rawAvgCost,
+                            'current_total_amount' => (float) $currentTotalAmount,
+                            'return_qty' => (float) $data['quantity'],
+                            'return_total' => (float) $data['total'],
+                            'rows' => $data['debug_rows'] ?? [],
+                            'new_stock' => (float) $newStockQty,
+                            'new_total_amount' => (float) $newTotalAmount,
+                            'new_avg_cost' => (float) $newAvgCost,
+                        ];
+                    }
+                }
+
                 $totalCashSaleVoucher = 0;
                 $invoice = new InvoiceReturn();
                 $invoice->invoice_id   = $request->id;
@@ -662,7 +831,11 @@ class InvoiceReturnController extends Controller
                 }
             });
 
-            return ['status' => "ok", 'message' => 'Invoice Stored Successfully'];
+            $resp = ['status' => "ok", 'message' => 'Invoice Stored Successfully'];
+            if ($debugAvgCost) {
+                $resp['avg_cost_debug'] = $avgCostDebug;
+            }
+            return $resp;
         } catch (\Exception $e) {
             return ['status' => 'error', 'message' => $e->getMessage()];
         }
@@ -884,32 +1057,66 @@ class InvoiceReturnController extends Controller
         }
 
         try {
-
-
             DB::transaction(function () use ($request) {
-                $invno = $request->id;
-                $ItemInventory = InvoiceChildReturn::where('ret_invoice_id', $invno)->select('id')->get();
+                $retInvoiceId = $request->id;
 
-                if ($ItemInventory) {
-                    foreach ($ItemInventory as  $ItemInventory) {
-                        ItemInventory::where('return_invoice_id', $ItemInventory->id)->delete();
+                // 1) Revert avg_cost BEFORE deleting inventory rows (current stock still includes this return)
+                $returnChildren = InvoiceChildReturn::where('ret_invoice_id', $retInvoiceId)->get();
+
+                // Group by item_id to reverse the return effect:
+                // newAvg = ((currentAvg * currentStock) - (returnQty * costAtSale)) / (currentStock - returnQty)
+                $grouped = [];
+                foreach ($returnChildren as $child) {
+                    $itemId = $child->item_id;
+                    if (!isset($grouped[$itemId])) {
+                        $grouped[$itemId] = ['qty' => 0.0, 'value' => 0.0];
+                    }
+                    $qty = (float) $child->quantity;
+                    $costAtSale = is_numeric($child->cost) ? (float) $child->cost : 0.0;
+                    $grouped[$itemId]['qty'] += $qty;
+                    $grouped[$itemId]['value'] += ($qty * $costAtSale);
+                }
+
+                foreach ($grouped as $itemId => $data) {
+                    $item = Item::find($itemId);
+                    if (!$item) {
+                        continue;
+                    }
+
+                    $currentStock = Item::calculateTotalStockQty($itemId); // includes this return qty_in
+                    $currentTotalAmount = (float) $item->avg_cost * (float) $currentStock;
+
+                    $newStockQty = (float) $currentStock - (float) $data['qty'];
+                    $newTotalAmount = (float) $currentTotalAmount - (float) $data['value'];
+
+                    $newAvgCost = $newStockQty > 0 ? ($newTotalAmount / $newStockQty) : 0.0;
+                    $item->avg_cost = $newAvgCost;
+                    $item->save();
+                }
+
+                // 2) Delete ItemInventory rows linked to this return invoice
+                $invChildIds = InvoiceChildReturn::where('ret_invoice_id', $retInvoiceId)->select('id')->get();
+                if ($invChildIds) {
+                    foreach ($invChildIds as $row) {
+                        ItemInventory::where('return_invoice_id', $row->id)->delete();
                     }
                 }
-            });
-            InvoiceChildReturn::where(['ret_invoice_id' => $request->id])->delete();
-            $parentDelete = InvoiceReturn::where(['id' => $request->id])->delete();
 
-            $voucher = Voucher::where('return_invoice_id', $request->id)->select('id')->get();
+                // 3) Delete return children + parent
+                InvoiceChildReturn::where(['ret_invoice_id' => $retInvoiceId])->delete();
+                InvoiceReturn::where(['id' => $retInvoiceId])->delete();
 
-            if (count($voucher) > 0) {
-
-                foreach ($voucher as  $voucher) {
-                    Voucher::where('id', $voucher->id)->delete();
-                    VoucherTransaction::where('voucher_id', $voucher->id)->delete();
+                // 4) Delete vouchers inside the same transaction so we don't end up with partial state
+                $vouchers = Voucher::where('return_invoice_id', $retInvoiceId)->select('id')->get();
+                if (count($vouchers) > 0) {
+                    foreach ($vouchers as $v) {
+                        Voucher::where('id', $v->id)->delete();
+                        VoucherTransaction::where('voucher_id', $v->id)->delete();
+                    }
+                } else {
+                    throw new \Exception('Voucher Not Found');
                 }
-            } else {
-                throw new \Exception('Voucher Not Found');
-            }
+            });
 
 
             //  $ItemInventory = ItemInventory::with('invoicechild')->whereHas('invoicechild', function ($query) use ($invno) {
