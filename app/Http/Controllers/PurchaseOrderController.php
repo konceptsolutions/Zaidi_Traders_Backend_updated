@@ -575,6 +575,18 @@ class PurchaseOrderController extends Controller
             $purchaseorder->total_after_discount = $request->total_after_discount;
             $purchaseorder->save();
 
+            // Capture old PO totals per item (before we update/delete) for avg cost re-receive formula
+            $oldPOByItem = ['quantity' => [], 'total' => []];
+            foreach (PurchaseOrderChild::where('purchase_order_id', $request->id)->get() as $oldChild) {
+                $id = $oldChild->item_id;
+                if (!isset($oldPOByItem['quantity'][$id])) {
+                    $oldPOByItem['quantity'][$id] = 0;
+                    $oldPOByItem['total'][$id] = 0;
+                }
+                $oldPOByItem['quantity'][$id] += (float) $oldChild->received_quantity;
+                $oldPOByItem['total'][$id] += (float) $oldChild->total;
+            }
+
             /*===== delete ItemInventory =====*/
             foreach ($request->childArray as $row) {
                 $purchaseChilddata = PurchaseOrderChild::find($row['id']);
@@ -587,218 +599,150 @@ class PurchaseOrderController extends Controller
 
             // Validate expiry dates first
             foreach ($request->childArray as $row) {
-                if ($request->po_type == 1) {
-                    $a = $row['manufacturer_id'];
-                } elseif ($request->po_type == 2) {
-                    $a = $request->manufacturer_id;
-                }
+                $a = ($request->po_type == 1) ? ($row['manufacturer_id'] ?? null) : ($request->manufacturer_id ?? null);
+                $CheckExpDate = ItemInventory::where([
+                    'batch_no' => $row['batch_no'] ?? '',
+                    'item_id' => $row['item_id'] ?? null,
+                    'manufacture_id' => $a
+                ])->first() ?? null;
 
-                $CheckExpDate = ItemInventory::where(['batch_no' => $row['batch_no'], 'item_id' => $row['item_id'], 'manufacture_id' => $a])->first() ?? null;
-
-                if ($CheckExpDate != null && $CheckExpDate->expiry_date != $row['expiry_date']) {
+                if ($CheckExpDate != null && $CheckExpDate->expiry_date != ($row['expiry_date'] ?? null)) {
                     DB::rollback();
-                    return ['status' => "error", 'message' => 'Batch already exists with different expiry Date' . ' ' . $row['batch_no'] . ' ' . '(' . $CheckExpDate->expiry_date . ')'];
+                    return ['status' => "error", 'message' => 'Batch already exists with different expiry Date' . ' ' . ($row['batch_no'] ?? '') . ' ' . '(' . $CheckExpDate->expiry_date . ')'];
                 }
             }
 
             // Process individual items
             foreach ($request->childArray as $row) {
-                if ($request->po_type == 1) {
-                    $a = $row['manufacturer_id'];
-                } elseif ($request->po_type == 2) {
-                    $a = $request->manufacturer_id;
-                }
+                $batchNo = $row['batch_no'] ?? '';
+                $itemId = $row['item_id'] ?? null;
+                $expiryDate = $row['expiry_date'] ?? null;
+                $manufacturerId = ($request->po_type == 1) ? ($row['manufacturer_id'] ?? null) : ($request->manufacturer_id ?? null);
 
-                $CheckExpDate = ItemInventory::where(['batch_no' => $row['batch_no'], 'item_id' => $row['item_id'], 'manufacture_id' => $a])->first() ?? null;
+                $CheckExpDate = ItemInventory::where(['batch_no' => $batchNo, 'item_id' => $itemId, 'manufacture_id' => $manufacturerId])->first() ?? null;
 
-                if ($CheckExpDate == null || ($CheckExpDate != null && $CheckExpDate->expiry_date == $row['expiry_date'])) {
+                if ($CheckExpDate == null || ($CheckExpDate != null && $CheckExpDate->expiry_date == $expiryDate)) {
                     $purchaseChilddata = PurchaseOrderChild::find($row['id']);
                     $purchaseChilddata->received_quantity = $row['received_quantity'];
-
-                    if ($request->po_type == 1) {
-                        $purchaseChilddata->manufacturer_id = $row['manufacturer_id'];
-                    } elseif ($request->po_type == 2) {
-                        $purchaseChilddata->manufacturer_id = $request->manufacturer_id;
-                    }
-                    $purchaseChilddata->batch_no = $row['batch_no'];
-                    $purchaseChilddata->pack = $row['pack'];
-                    $purchaseChilddata->expiry_date = $row['expiry_date'];
-                    $purchaseChilddata->rate = $row['purchase_price'];
-                    $purchaseChilddata->total = $row['amount'];
-                    $purchaseChilddata->remarks = $row['remarks'];
+                    $purchaseChilddata->manufacturer_id = $manufacturerId;
+                    $purchaseChilddata->batch_no = $batchNo;
+                    $purchaseChilddata->pack = $row['pack'] ?? 1;
+                    $purchaseChilddata->expiry_date = $expiryDate;
+                    $purchaseChilddata->rate = $row['purchase_price'] ?? 0;
+                    $purchaseChilddata->total = $row['amount'] ?? ($row['received_quantity'] * ($row['purchase_price'] ?? 0));
+                    $purchaseChilddata->remarks = $row['remarks'] ?? '';
                     $purchaseChilddata->save();
                     $purchaseChild_id = $purchaseChilddata->id;
 
                     $itemInventory = new ItemInventory();
                     $itemInventory->purchase_order_id = $purchaseChild_id;
                     $itemInventory->store_id = $request->store_id;
-                    $itemInventory->batch_no = $row['batch_no'];
-                    $itemInventory->item_id = $row['item_id'];
-                    if ($request->po_type == 1) {
-                        $itemInventory->manufacture_id = $row['manufacturer_id'];
-                    } elseif ($request->po_type == 2) {
-                        $itemInventory->manufacture_id = $request->manufacturer_id;
-                    }
-                    $itemInventory->expiry_date = $row['expiry_date'];
+                    $itemInventory->batch_no = $batchNo;
+                    $itemInventory->item_id = $itemId;
+                    $itemInventory->manufacture_id = $manufacturerId;
+                    $itemInventory->expiry_date = $expiryDate;
                     $itemInventory->inventory_type_id = 1;
                     $itemInventory->quantity_in = $row['received_quantity'];
-                    $itemInventory->purchase_price = $row['purchase_price'];
+                    $itemInventory->purchase_price = $row['purchase_price'] ?? 0;
                     $itemInventory->date = $request->receive_date;
                     $itemInventory->save();
 
-                    $itemUpdate = Item::find($row['item_id']);
-                    $itemUpdate->pack = $row['pack'];
-                    $itemUpdate->rate = $row['purchase_price'];
-                    $itemUpdate->save();
+                    $itemUpdate = Item::find($itemId);
+                    if ($itemUpdate) {
+                        $itemUpdate->pack = $row['pack'] ?? 1;
+                        $itemUpdate->rate = $row['purchase_price'] ?? 0;
+                        $itemUpdate->save();
+                    }
                 } else {
                     DB::rollback();
-                    return ['status' => "error", 'message' => 'Batch already exists with different expiry Date' . ' ' . $row['batch_no'] . ' ' . '(' . $CheckExpDate->expiry_date . ')'];
+                    return ['status' => "error", 'message' => 'Batch already exists with different expiry Date' . ' ' . $batchNo . ' ' . '(' . $CheckExpDate->expiry_date . ')'];
                 }
             }
 
+            // Voucher logic commented out - voucher created via vouchersForReceiveCompleted() after commit
             // $remarks = " PO: ";
-            // $supplier_coa_account_id = CoaAccount::where([['person_id', $request->supplier_id]])->value('id');
-            // $supplier_name = Person::where('id', $request->supplier_id)->first();
+            // $supplier_id = $purchaseorder->person_id ?? $request->supplier_id ?? null;
+            // $supplier_coa_account_id = $supplier_id ? CoaAccount::where('person_id', $supplier_id)->value('id') : null;
+            // $supplier_name = $supplier_id ? Person::where('id', $supplier_id)->first() : null;
+            // $supplierLabel = $supplier_name ? ($supplier_name->id . '-' . $supplier_name->name) : 'N/A';
             // $is_post_dated = isset($request->cheque_no) ? 1 : 0;
             // $getVoucherNo = DB::table('vouchers')->where('type', 3)->orderBy('id', 'desc')->first();
             // $newVoucherNo = $getVoucherNo ? $getVoucherNo->voucher_no + 1 : 1;
-
             // $voucher = new Voucher();
             // $voucher->voucher_no = $newVoucherNo;
             // $voucher->date = $request->receive_date;
-            // $voucher->name =  "Purchase Order PO no: " .  $purchaseorder->po_no . ' Supplier: ' . $supplier_name->id . '-' . $supplier_name->name;
+            // $voucher->name = "Purchase Order PO no: " . $purchaseorder->po_no . ' Supplier: ' . $supplierLabel;
             // $voucher->type = 3;
             // $voucher->isApproved = 1;
-            // $voucher->generated_at = $request->receive_date;;
+            // $voucher->generated_at = $request->receive_date;
             // $voucher->total_amount = 0;
             // $voucher->purchase_order_id = $request->id;
-            // $voucher->cheque_no = $request->cheque_no;
-            // $voucher->cheque_date = $request->cheque_date;
+            // $voucher->cheque_no = $request->cheque_no ?? null;
+            // $voucher->cheque_date = $request->cheque_date ?? null;
             // $voucher->is_post_dated = $is_post_dated;
             // $voucher->is_auto = 1;
             // $voucher->save();
             // $voucher_id = $voucher->id;
             // $debitside = 0;
             // $creditside = 0;
-            // //---------------------Debit Inventory  account ------------------
-            // foreach ($request->childArray as $row) {
-            //     $PurchasePrice = PurchaseOrderChild::with('item')->where('item_id', $row['item_id'])->groupby('item_id')->select(DB::raw('SUM(rate*quantity) / (SUM(quantity * pack)) as AvgPrice'), 'item_id')->first();
-            //     $itemName = $PurchasePrice->item;
+            // foreach ($request->childArray as $row) { ... }
+            // if ($supplier_coa_account_id) { ... }
+            // if ($request->discount > 0) { ... }
+            // if ($request->tax_in_figure > 0) { ... }
+            // if (($request->adv_tax ?? 0) > 0) { ... }
+            // $updateVoucher = Voucher::find($voucher_id);
+            // $updateVoucher->total_amount = $debitside;
+            // $updateVoucher->save();
 
-            //     $voucherTransaction = new VoucherTransaction();
-            //     $voucherTransaction->voucher_id = $voucher_id;
-            //     $voucherTransaction->date = $request->receive_date;;
-            //     $voucherTransaction->coa_account_id = 1;
-            //     $voucherTransaction->is_approved = 1;
-            //     $voucherTransaction->debit = $row['amount'] + $row['cost'];
-            //     $voucherTransaction->credit = 0;
-            //     $voucherTransaction->description = $remarks . 'PO no: ' . $purchaseorder->po_no . ', Item: ' . $itemName->id . '-' . $itemName->name . " Inventory Added. " . ' Pack size: ' . $row['pack'] . ', Qty:' . $row['received_quantity'] . ', Total Qty:' . $row['received_quantity'] * $row['pack'] . ', Rate: ' . $row['purchase_price'] . ', Batch No: ' . $row['batch_no'];
+            // Group items by item_id from saved PO children (not request) so avg always runs for received items
+            $groupedItems = [];
+            foreach (PurchaseOrderChild::where('purchase_order_id', $request->id)->get() as $child) {
+                $itemId = (int) $child->item_id;
+                if (!isset($groupedItems[$itemId])) {
+                    $groupedItems[$itemId] = ['quantity' => 0, 'total' => 0];
+                }
+                $groupedItems[$itemId]['quantity'] += (float) $child->received_quantity;
+                $groupedItems[$itemId]['total'] += (float) $child->total;
+            }
 
-            //     $voucherTransaction->save();
-            //     $debitside += $row['amount'] + $row['cost'];
-            // }
-            // //   --------------Crediting Supplier account --------------------
-            // $suppliername = CoaAccount::where('id', $supplier_coa_account_id)->value('name');
-            // $voucherTransaction = new VoucherTransaction();
-            // $voucherTransaction->voucher_id = $voucher_id;
-            // $voucherTransaction->date = $request->receive_date;;
-            // $voucherTransaction->coa_account_id = $supplier_coa_account_id;
-            // $voucherTransaction->credit = $request->total;
-            // $voucherTransaction->debit = 0;
-            // $voucherTransaction->is_approved = 1;
-            // $voucherTransaction->description = $remarks . 'PO no: ' . $purchaseorder->po_no .  '  '  . $suppliername . " Liability Created";
-            // $voucherTransaction->save();
-            // $creditside += $request->total;
+            // Calculate and save average cost for each item (no check on receivePurchaseOrderComplete)
+            foreach ($groupedItems as $itemId => $data) {
+                if ($itemId <= 0) {
+                    continue;
+                }
+                $currentAvgCost = (float) (DB::table('items')->where('id', $itemId)->value('avg_cost') ?? 0);
+                $currentStock = (float) Item::calculateTotalStockQty($itemId);
+                $oldPOQty = (float) ($oldPOByItem['quantity'][$itemId] ?? 0);
+                $oldPOTotal = (float) ($oldPOByItem['total'][$itemId] ?? 0);
 
-            // if ($request->discount > 0) {
-            //     $sumAmountofdiscount = 0;
-            //     //---------------------Crediting cost invenotry discount ------------------
-            //     $voucherTransaction = new VoucherTransaction();
-            //     $voucherTransaction->voucher_id = $voucher_id;
-            //     $voucherTransaction->date = $request->receive_date;;
-            //     $voucherTransaction->coa_account_id = 27;
-            //     $voucherTransaction->is_approved = 1;
-            //     $voucherTransaction->debit = 0;
-            //     $voucherTransaction->credit =  $request->discount;
-            //     $voucherTransaction->description = 'Discount' . 'PO no: ' . $purchaseorder->po_no .  '  '  . $suppliername . " Discount availed";
+                $receivedQty = (float) $data['quantity'];
+                $receivedTotal = (float) $data['total'];
 
-            //     $voucherTransaction->save();
-            //     $creditside += $request->discount;
-            //     //---------------------Debiting supplier discount   ------------------
+                // When current stock is zero: new avg = this receive's unit cost (received total / received qty)
+                if ($currentStock <= 0) {
+                    $newAvgCost = ($receivedQty > 0 && $receivedTotal >= 0)
+                        ? ($receivedTotal / $receivedQty)
+                        : $currentAvgCost;
+                } else {
+                    // Weighted average when we have existing stock
+                    $stockBeforeThisReceive = $currentStock - $receivedQty + $oldPOQty;
+                    $newTotalValue = $currentAvgCost * $stockBeforeThisReceive - $oldPOTotal + $receivedTotal;
+                    $newStockQty = $currentStock;
+                    $newAvgCost = $newStockQty > 0 ? ($newTotalValue / $newStockQty) : $currentAvgCost;
+                }
 
-            //     $voucherTransaction = new VoucherTransaction();
-            //     $voucherTransaction->voucher_id = $voucher_id;
-            //     $voucherTransaction->date = $request->receive_date;;
-            //     $voucherTransaction->coa_account_id = $supplier_coa_account_id;
-            //     $voucherTransaction->is_approved = 1;
-            //     $voucherTransaction->debit = $request->discount;
-            //     $voucherTransaction->credit = 0;
-            //     $voucherTransaction->description = 'Discount' . 'PO no: ' . $purchaseorder->po_no .  '  '  . $suppliername . " Discount availed";
-            //     $voucherTransaction->save();
-            //     $sumAmountofdiscount += $request->discount;
-            //     $debitside += $request->discount;
-            // }
-
-            // if ($request->tax_in_figure > 0) {
-            //     //---------------------Crediting purchase tax payable  tax ------------------
-            //     $voucherTransaction = new VoucherTransaction();
-            //     $voucherTransaction->voucher_id = $voucher_id;
-            //     $voucherTransaction->date = $request->receive_date;;
-            //     $voucherTransaction->coa_account_id = 31;
-            //     $voucherTransaction->is_approved = 1;
-            //     $voucherTransaction->debit = 0;
-            //     $voucherTransaction->credit =  $request->tax_in_figure;
-            //     $voucherTransaction->description = 'Tax ' . 'PO no: ' . $purchaseorder->po_no .  '  '  . $suppliername . " Tax liability";
-            //     $voucherTransaction->save();
-            //     $creditside += $request->tax_in_figure;
-            //     //---------------------Debiting purchase tax expenses    ------------------
-
-            //     $voucherTransaction = new VoucherTransaction();
-            //     $voucherTransaction->voucher_id = $voucher_id;
-            //     $voucherTransaction->date = $request->receive_date;;
-            //     $voucherTransaction->coa_account_id = 30;
-            //     $voucherTransaction->is_approved = 1;
-            //     $voucherTransaction->debit = $request->tax_in_figure;
-            //     $voucherTransaction->credit = 0;
-            //     $voucherTransaction->description = 'Tax ' . 'PO no: ' . $purchaseorder->po_no .  '  '  . $suppliername . " Tax expense";
-            //     $voucherTransaction->save();
-            //     $debitside += $request->tax_in_figure;
-            // }
-
-            // if($request->adv_tax > 0)
-            // {
-            //     $voucherTransaction = new VoucherTransaction();
-            //     $voucherTransaction->voucher_id = $voucher_id;
-            //     $voucherTransaction->date = $request->receive_date;
-            //     $voucherTransaction->coa_account_id = 873;
-            //     $voucherTransaction->debit = $request->adv_tax;
-            //     $voucherTransaction->credit = 0;
-            //     $voucherTransaction->is_approved = 1;
-            //     $voucherTransaction->description =  "Advance Purchase Tax " . 'PO no: ' . $request->po_no;
-            //     $voucherTransaction->save();
-            //     $debitside += $request->adv_tax;
-
-            //     $voucherTransaction = new VoucherTransaction();
-            //     $voucherTransaction->voucher_id = $voucher_id;
-            //     $voucherTransaction->date = $request->receive_date;
-            //     $voucherTransaction->coa_account_id = 872;
-            //     $voucherTransaction->debit = 0;
-            //     $voucherTransaction->credit = $request->adv_tax;
-            //     $voucherTransaction->is_approved = 1;
-            //     $voucherTransaction->description =  "Advance Purchase Tax " . 'PO no: ' . $request->po_no;
-            //     $voucherTransaction->save();
-            //     $creditside += $request->adv_tax;
-            // }
-
-            // if ($creditside != $debitside) {
-            //     throw new \Exception('debit and credit sides are not equal');
-            // } else {
-            //     $updateVoucher = Voucher::find($voucher_id);
-            //     $updateVoucher->total_amount = $debitside;
-            //     $updateVoucher->save();
-            // }
+                $newAvgCost = round((float) $newAvgCost, 2);
+                DB::update('UPDATE items SET avg_cost = ? WHERE id = ?', [$newAvgCost, $itemId]);
+            }
 
             DB::commit();
+
+            try {
+                $this->vouchersForReceiveCompleted($request->id);
+            } catch (\Exception $e) {
+                \Log::warning('Receive PO: voucher creation failed: ' . $e->getMessage(), ['po_id' => $request->id]);
+            }
+
             return ['status' => "ok", 'message' => 'Purchase Order Receive successfully'];
         } catch (\Exception $e) {
             DB::rollback();
@@ -1508,6 +1452,9 @@ class PurchaseOrderController extends Controller
         }
     }
 
+    /**
+     * Complete PO (no avg cost or voucher here - both are done in receivePurchaseOrder when receiving).
+     */
     public function receivePurchaseOrderComplete(Request $request)
     {
         $rules = array(
@@ -1518,110 +1465,7 @@ class PurchaseOrderController extends Controller
         if ($validator->fails()) {
             return ['status' => 'error', 'message' => $validator->errors()->first()];
         }
-        $po_id = $request->id;
 
-        DB::beginTransaction();
-        try {
-
-            // if ($request->is_pending == 0) {
-            $purchaseorder = PurchaseOrder::find($request->id);
-             if ($purchaseorder->is_completed == 1) {
-                throw new \Exception('Po is already completed');
-            }
-
-            // Get purchase order children for average cost calculation
-            $poChildren = PurchaseOrderChild::where('purchase_order_id', $request->id)->get();
-            
-            // Group items by item_id for average cost calculation
-            $groupedItems = [];
-            foreach ($poChildren as $child) {
-                $itemId = $child->item_id;
-                if (!isset($groupedItems[$itemId])) {
-                    $groupedItems[$itemId] = [
-                        'quantity' => 0,
-                        'total' => 0,
-                    ];
-                }
-
-                $groupedItems[$itemId]['quantity'] += (float) $child->received_quantity;
-                $groupedItems[$itemId]['total'] += (float) $child->total;
-            }
-
-            // Calculate average cost for grouped items
-            foreach ($groupedItems as $itemId => $data) {
-                // Get old totals from existing PO if it was already completed
-                $totalSumPurchaseOrder = PurchaseOrderChild::join('purchase_orders', 'purchase_orders.id', '=', 'purchase_order_children.purchase_order_id')
-                    ->where('purchase_order_children.item_id', $itemId)
-                    ->where('purchase_orders.id', $request->id)
-                    ->where('purchase_orders.is_completed', 1)
-                    ->sum('purchase_order_children.total');
-
-                $totalQtyPurchaseOrder = PurchaseOrderChild::join('purchase_orders', 'purchase_orders.id', '=', 'purchase_order_children.purchase_order_id')
-                    ->where('purchase_order_children.item_id', $itemId)
-                    ->where('purchase_orders.id', $request->id)
-                    ->where('purchase_orders.is_completed', 1)
-                    ->sum('purchase_order_children.received_quantity');
-
-                // Get current item
-                $item = Item::find($itemId);
-                
-                // Get current stock (includes this PO's items since receivePurchaseOrder was called)
-                $currentStockWithThisPO = Item::calculateTotalStockQty($itemId);
-                
-                // Calculate stock before this PO completion
-                // Subtract this PO's quantity and add back old completed quantity (if any)
-                $currentStock = $currentStockWithThisPO - $data['quantity'] + $totalQtyPurchaseOrder;
-                
-                // For average costing, use avg_cost * stock before this PO
-                // This is the correct approach because avg_cost represents the weighted average
-                // of all completed purchases
-                $currentTotalAmount = $item->avg_cost * $currentStock;
-                
-                // Calculate stock and value BEFORE this PO was completed
-                $stockBeforeThisPO = $currentStock + $totalQtyPurchaseOrder;
-                $totalAmountBeforeThisPO = $currentTotalAmount + $totalSumPurchaseOrder;
-
-                // Calculate new stock and total amount
-                if ($totalQtyPurchaseOrder > 0) {
-                    // PO was completed before, so we need to reverse the old completed PO and add the new one
-                    $newStockQty = $stockBeforeThisPO + $data['quantity'] - $totalQtyPurchaseOrder;
-                    $newTotalAmount = $totalAmountBeforeThisPO + $data['total'] - $totalSumPurchaseOrder;
-                } else {
-                    // First time completing this PO
-                    $newStockQty = $currentStock + $data['quantity'];
-                    $newTotalAmount = $currentTotalAmount + $data['total'];
-                }
-
-                // Calculate new average cost
-                if ($newStockQty > 0) {
-                    $newAvgCost = $newTotalAmount / $newStockQty;
-                } else {
-                    $newAvgCost = 0;
-                }
-
-                // Update the item's average cost
-                $item->avg_cost = $newAvgCost;
-                $item->save();
-            }
-
-            // Always create voucher/transactions regardless of current completion flag
-            $purchaseorder->is_completed = '1';
-            $purchaseorder->is_received = '1';
-            $purchaseorder->save();
-            $purchaseorder->po_no;
-            $po_id = $request->id;
-
-            $this->vouchersForReceiveCompleted($po_id);
-
-            DB::commit();
-
-            return ['status' => "ok", 'message' => 'Purchase Order Receive successfully'];
-
-        } catch (\Exception $e) {
-            DB::rollback();
-            $message = CustomErrorMessages::getCustomMessage($e);
-            return ['status' => 'error', 'message' => $message];
-        }
         return ['status' => "ok", 'message' => 'Completed successfully'];
     }
 
@@ -1629,8 +1473,24 @@ class PurchaseOrderController extends Controller
     {
         $remarks = " PO: ";
         $purchaseorder = PurchaseOrder::find($po_id);
-        $supplier_coa_account_id = CoaAccount::where('person_id', $purchaseorder->person_id)->value('id');
-        $supplier_name = Person::where('id', $purchaseorder->person_id)->first();
+        if (!$purchaseorder) {
+            return;
+        }
+
+        // Soft delete any previous voucher(s) for this PO when re-receiving
+        $existingVoucherIds = Voucher::where('purchase_order_id', $po_id)->pluck('id')->toArray();
+        if (!empty($existingVoucherIds)) {
+            VoucherTransaction::whereIn('voucher_id', $existingVoucherIds)->delete();
+            Voucher::whereIn('id', $existingVoucherIds)->delete();
+        }
+
+        $supplier_coa_account_id = $purchaseorder->person_id
+            ? CoaAccount::where('person_id', $purchaseorder->person_id)->value('id')
+            : null;
+        $supplier_name = $purchaseorder->person_id
+            ? Person::where('id', $purchaseorder->person_id)->first()
+            : null;
+        $supplierLabel = $supplier_name ? ($supplier_name->id . '-' . $supplier_name->name) : 'N/A';
 
         $getVoucherNo = DB::table('vouchers')->where('type', 3)->orderBy('id', 'desc')->first();
 
@@ -1639,7 +1499,7 @@ class PurchaseOrderController extends Controller
         $voucher = new Voucher();
         $voucher->voucher_no = $newVoucherNo;
         $voucher->date = $purchaseorder->receive_date;
-        $voucher->name = "Purchase Order PO no: " . $purchaseorder->po_no . ' Supplier: ' . $supplier_name->id . '-' . $supplier_name->name;
+        $voucher->name = "Purchase Order PO no: " . $purchaseorder->po_no . ' Supplier: ' . $supplierLabel;
         $voucher->type = 3;
         $voucher->isApproved = 1;
         $voucher->generated_at = $purchaseorder->receive_date;
@@ -1719,17 +1579,19 @@ class PurchaseOrderController extends Controller
         }
 
         // --------------Crediting Supplier account --------------------
-        $suppliername = CoaAccount::where('id', $supplier_coa_account_id)->value('name');
-        $voucherTransaction = new VoucherTransaction();
-        $voucherTransaction->voucher_id = $voucher_id;
-        $voucherTransaction->date = $purchaseorder->receive_date;
-        $voucherTransaction->coa_account_id = $supplier_coa_account_id;
-        $voucherTransaction->credit = $purchaseorder->total;
-        $voucherTransaction->debit = 0;
-        $voucherTransaction->is_approved = 1;
-        $voucherTransaction->description = $remarks . 'PO no: ' . $purchaseorder->po_no . '  ' . $suppliername . " Liability Created";
-        $voucherTransaction->save();
-        $creditside += $purchaseorder->total;
+        $suppliername = $supplier_coa_account_id ? (CoaAccount::where('id', $supplier_coa_account_id)->value('name') ?? $supplierLabel) : $supplierLabel;
+        if ($supplier_coa_account_id) {
+            $voucherTransaction = new VoucherTransaction();
+            $voucherTransaction->voucher_id = $voucher_id;
+            $voucherTransaction->date = $purchaseorder->receive_date;
+            $voucherTransaction->coa_account_id = $supplier_coa_account_id;
+            $voucherTransaction->credit = $purchaseorder->total;
+            $voucherTransaction->debit = 0;
+            $voucherTransaction->is_approved = 1;
+            $voucherTransaction->description = $remarks . 'PO no: ' . $purchaseorder->po_no . '  ' . $suppliername . " Liability Created";
+            $voucherTransaction->save();
+            $creditside += $purchaseorder->total;
+        }
 
         if ($purchaseorder->discount > 0) {
             $sumAmountofdiscount = 0;
@@ -1745,18 +1607,19 @@ class PurchaseOrderController extends Controller
             $voucherTransaction->save();
             $creditside += $purchaseorder->discount;
             //---------------------Debiting supplier discount ------------------
-
-            $voucherTransaction = new VoucherTransaction();
-            $voucherTransaction->voucher_id = $voucher_id;
-            $voucherTransaction->date = $purchaseorder->receive_date;
-            $voucherTransaction->coa_account_id = $supplier_coa_account_id;
-            $voucherTransaction->is_approved = 1;
-            $voucherTransaction->debit = $purchaseorder->discount;
-            $voucherTransaction->credit = 0;
-            $voucherTransaction->description = 'Discount' . 'PO no: ' . $purchaseorder->po_no . '  ' . $suppliername . " Discount availed";
-            $voucherTransaction->save();
-            $sumAmountofdiscount += $purchaseorder->discount;
-            $debitside += $purchaseorder->discount;
+            if ($supplier_coa_account_id) {
+                $voucherTransaction = new VoucherTransaction();
+                $voucherTransaction->voucher_id = $voucher_id;
+                $voucherTransaction->date = $purchaseorder->receive_date;
+                $voucherTransaction->coa_account_id = $supplier_coa_account_id;
+                $voucherTransaction->is_approved = 1;
+                $voucherTransaction->debit = $purchaseorder->discount;
+                $voucherTransaction->credit = 0;
+                $voucherTransaction->description = 'Discount' . 'PO no: ' . $purchaseorder->po_no . '  ' . $suppliername . " Discount availed";
+                $voucherTransaction->save();
+                $sumAmountofdiscount += $purchaseorder->discount;
+                $debitside += $purchaseorder->discount;
+            }
         }
 
         if ($purchaseorder->tax_in_figure > 0) {

@@ -1055,7 +1055,7 @@ class VoucherController extends Controller
         $rules = array(
             'customer_id' => 'required',
             'amount' => 'required|int',
-            'invoice_id' => 'required|array',
+            'invoice_id' => 'required',
             'date' => 'required',
             'account_id' => 'required|int'
         );
@@ -1063,6 +1063,12 @@ class VoucherController extends Controller
         if ($validator->fails()) {
             return ['status' => 'error', 'message' => $validator->errors()->first()];
         }
+        
+        // Normalize invoice_id to always be an array
+        if (!is_array($req->invoice_id)) {
+            $req->merge(['invoice_id' => [$req->invoice_id]]);
+        }
+        
         // To get the date Financial Year Closed
         $getFinYearClosing = DB::table('fin_year_closing')->select('to_date')->orderBy('to_date', 'desc')->first();
 
@@ -1155,7 +1161,7 @@ class VoucherController extends Controller
         $rules = array(
             'supplier_id' => 'required',
             'amount' => 'required|int',
-            'po_id' => 'required|array',
+            'po_id' => 'required',
             'date' => 'required',
             'account_id' => 'required|int'
         );
@@ -1163,6 +1169,12 @@ class VoucherController extends Controller
         if ($validator->fails()) {
             return ['status' => 'error', 'message' => $validator->errors()->first()];
         }
+        
+        // Normalize po_id to always be an array
+        if (!is_array($req->po_id)) {
+            $req->merge(['po_id' => [$req->po_id]]);
+        }
+        
         // To get the date Financial Year Closed
         $getFinYearClosing = DB::table('fin_year_closing')->select('to_date')->orderBy('to_date', 'desc')->first();
 

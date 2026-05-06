@@ -10,7 +10,7 @@ class Item extends Model
 {
     use HasFactory;
 
-    protected $fillable = ['category_id', 'subcategory_id', 'name', 'type', 'rate', 'strength', 'manufacture_id', 'nomenclature', 'strength_unit_id', 'minimumlevel', 'unit_id', 'pack'];
+    protected $fillable = ['category_id', 'subcategory_id', 'name', 'type', 'rate', 'avg_cost', 'strength', 'manufacture_id', 'nomenclature', 'strength_unit_id', 'minimumlevel', 'unit_id', 'pack'];
 
     public function subcategory()
     {
@@ -35,7 +35,7 @@ class Item extends Model
 
     public function iteminventory()
     {
-        $date = date('y-m-d');
+        $date = date('Y-m-d');
         return $this->hasMany(ItemInventory::class, 'item_id', 'id')
             ->where('expiry_date', '>', $date)
             ->where('is_dummy', 0)
@@ -53,7 +53,7 @@ class Item extends Model
     }
     public function itemAvaiableInventory()
     {
-        $date = date('y-m-d');
+        $date = date('Y-m-d');
         return $this->hasOne(ItemInventory::class, 'item_id', 'id')
             ->where('is_dummy', 0)->groupby('item_id')
             ->where('expiry_date', '>', $date)
@@ -61,7 +61,7 @@ class Item extends Model
         }
     public function itemAvaiableAndExpiredInventory()
     {
-        $date = date('y-m-d');
+        $date = date('Y-m-d');
         return $this->hasOne(ItemInventory::class, 'item_id', 'id')
             ->where('is_dummy', 0)->groupby('item_id')
             ->where('expiry_date', '>', $date)
@@ -69,10 +69,11 @@ class Item extends Model
     }
     public static function calculateTotalStockQty($itemId)
     {
-        $date = date('y-m-d');
+        $date = date('Y-m-d');
+        // Include rows where expiry_date is null (treat as never expiring) or expiry_date > today
         $data = ItemInventory::where('is_dummy', 0)
             ->where('item_id', $itemId)
-            ->where('expiry_date', '>', $date)
+            ->whereRaw('(expiry_date IS NULL OR expiry_date > ?)', [$date])
             ->groupby('item_id')
             ->select(DB::raw('SUM(quantity_in) - SUM(quantity_out) as item_available'))
             ->first();

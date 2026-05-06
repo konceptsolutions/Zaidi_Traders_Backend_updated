@@ -222,7 +222,7 @@ class ReturnPurhaseController extends Controller
                     if ($newStockQty > 0) {
                         $newAvgCost = $newTotalAmount / $newStockQty;
                     } else {
-                        $newAvgCost = 0;
+                       $newAvgCost = $item->avg_cost;
                     }
 
                     // Update the item's average cost
@@ -857,7 +857,7 @@ class ReturnPurhaseController extends Controller
                     if ($newStockQty > 0) {
                         $newAvgCost = $newTotalAmount / $newStockQty;
                     } else {
-                        $newAvgCost = 0;
+                        $newAvgCost = $item->avg_cost;
                     }
 
                     // Update the item's average cost

@@ -1263,7 +1263,8 @@ class InvoiceController extends Controller
                 if ($newStockQty > 0) {
                     $newAvgCost = $newTotalAmount / $newStockQty;
                 } else {
-                    $newAvgCost = 0;
+                    // If stock becomes zero or negative, keep previous avg_cost instead of forcing it to zero
+                    $newAvgCost = $item->avg_cost;
                 }
                 
                 // Update the item's average cost
@@ -1988,7 +1989,8 @@ class InvoiceController extends Controller
                     if ($newStockQty > 0) {
                         $newAvgCost = $newTotalAmount / $newStockQty;
                     } else {
-                        $newAvgCost = 0;
+                        // If stock becomes zero or negative, keep previous avg_cost instead of forcing it to zero
+                        $newAvgCost = $item->avg_cost;
                     }
 
                     // Update the item's average cost

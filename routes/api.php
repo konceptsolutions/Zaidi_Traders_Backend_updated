@@ -785,6 +785,13 @@ Route::get('getInventoryAccounts', [CoaAccountController::class, 'getInventoryAc
 Route::get('getDisposeAccounts', [CoaAccountController::class, 'getDisposeAccounts']);
 
 /**
+ * Getting accounts with duplicate person_id
+ *
+ * @return \Illuminate\Http\Response
+ */
+Route::get('getDuplicatePersonAccounts', [CoaAccountController::class, 'getDuplicatePersonAccounts']);
+
+/**
  * @param \Illuminate\Http\Request person_type_id
  * Display a listing of the resource.
  *

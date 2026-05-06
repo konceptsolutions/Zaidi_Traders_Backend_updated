@@ -6,6 +6,7 @@ use App\Models\CoaAccount;
 use App\Models\CoaGroup;
 use App\Models\CoaSubGroup;
 use App\Models\Land;
+use App\Models\Person;
 use App\Models\VoucherTransaction;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -573,6 +574,64 @@ class CoaAccountController extends Controller
             $disposeAccounts = CoaAccount::where('coa_group_id', 8)->where('coa_sub_group_id', 16)->where('code', 802042)->get();
 
             return ['disposeAccounts' => $disposeAccounts];
+        } catch (\Exception $e) {
+            return ['status' => 'error', 'message' => $e->getMessage()];
+        }
+    }
+
+    /**
+     * Get accounts with duplicate person_id
+     *
+     * @return \Illuminate\Http\Response
+     */
+    public function getDuplicatePersonAccounts()
+    {
+        try {
+            // Find person_ids that appear more than once
+            $duplicatePersonIds = CoaAccount::select('person_id', DB::raw('COUNT(*) as count'))
+                ->whereNotNull('person_id')
+                ->groupBy('person_id')
+                ->havingRaw('COUNT(*) > 1')
+                ->pluck('person_id');
+
+            // Get all accounts with those person_ids
+            $duplicateAccounts = CoaAccount::whereIn('person_id', $duplicatePersonIds)
+                ->with(['person', 'coaGroup', 'coaSubGroup'])
+                ->orderBy('person_id')
+                ->orderBy('id')
+                ->get();
+
+            // Group by person_id for better presentation
+            $groupedAccounts = $duplicateAccounts->groupBy('person_id');
+
+            $result = [];
+            foreach ($groupedAccounts as $personId => $accounts) {
+                $result[] = [
+                    'person_id' => $personId,
+                    'person_name' => $accounts->first()->person->name ?? 'N/A',
+                    'count' => $accounts->count(),
+                    'accounts' => $accounts->map(function ($account) {
+                        return [
+                            'id' => $account->id,
+                            'name' => $account->name,
+                            'code' => $account->code,
+                            'coa_group_id' => $account->coa_group_id,
+                            'coa_group_name' => $account->coaGroup->name ?? 'N/A',
+                            'coa_sub_group_id' => $account->coa_sub_group_id,
+                            'coa_sub_group_name' => $account->coaSubGroup->name ?? 'N/A',
+                            'description' => $account->description,
+                            'is_active' => $account->isActive,
+                            'is_default' => $account->isDefault,
+                        ];
+                    })
+                ];
+            }
+
+            return [
+                'status' => 'ok',
+                'total_duplicate_persons' => count($result),
+                'duplicate_accounts' => $result
+            ];
         } catch (\Exception $e) {
             return ['status' => 'error', 'message' => $e->getMessage()];
         }

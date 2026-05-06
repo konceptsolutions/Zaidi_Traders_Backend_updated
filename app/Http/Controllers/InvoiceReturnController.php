@@ -335,7 +335,8 @@ class InvoiceReturnController extends Controller
                     $currentTotalAmount = $currentAvgCost * $currentStock;
                     $newStockQty = $currentStock + $data['quantity'];
                     $newTotalAmount = $currentTotalAmount + $data['total'];
-                    $newAvgCost = $newStockQty > 0 ? ($newTotalAmount / $newStockQty) : 0;
+                    // If newStockQty is zero or negative, keep existing avg_cost instead of forcing it to zero
+                    $newAvgCost = $newStockQty > 0 ? ($newTotalAmount / $newStockQty) : $currentAvgCost;
 
                     if ($debugAvgCost) {
                         Log::error('InvoiceReturn avg_cost calc', [
@@ -1089,7 +1090,8 @@ class InvoiceReturnController extends Controller
                     $newStockQty = (float) $currentStock - (float) $data['qty'];
                     $newTotalAmount = (float) $currentTotalAmount - (float) $data['value'];
 
-                    $newAvgCost = $newStockQty > 0 ? ($newTotalAmount / $newStockQty) : 0.0;
+                    // If newStockQty is zero or negative, keep existing avg_cost instead of forcing it to zero
+                    $newAvgCost = $newStockQty > 0 ? ($newTotalAmount / $newStockQty) : (float) $item->avg_cost;
                     $item->avg_cost = $newAvgCost;
                     $item->save();
                 }

@@ -308,9 +308,11 @@ class AdjustInventoryController extends Controller
                         if ($newStockQty > 0) {
                             $newAvgCost = $newTotalAmount / $newStockQty;
                         } elseif ($newTotalAmount > 0 && $newStockQty == 0) {
-                            $newAvgCost = $item->avg_cost; // Retain the current avg_cost
+                            // Stock goes to zero but there is still positive value; keep previous average
+                            $newAvgCost = $item->avg_cost;
                         } else {
-                            $newAvgCost = 0; // Default to 0 when both newTotalAmount and newStockQty are 0
+                            // Both stock and value are zero (fully cleared); keep existing avg_cost instead of forcing zero
+                            $newAvgCost = $item->avg_cost;
                         }
 
                         // Update item with new average cost
@@ -873,9 +875,11 @@ class AdjustInventoryController extends Controller
                             if ($newStockQty > 0) {
                                 $newAvgCost = $newTotalAmount / $newStockQty;
                             } elseif ($newTotalAmount > 0 && $newStockQty == 0) {
-                                $newAvgCost = $item->avg_cost; // Retain the current avg_cost
+                                // Stock goes to zero but there is still positive value; keep previous average
+                                $newAvgCost = $item->avg_cost;
                             } else {
-                                $newAvgCost = 0; // Default to 0 when both newTotalAmount and newStockQty are 0
+                                // Both stock and value are zero (fully cleared); keep existing avg_cost instead of forcing zero
+                                $newAvgCost = $item->avg_cost;
                             }
 
                             $item->avg_cost = $newAvgCost;
