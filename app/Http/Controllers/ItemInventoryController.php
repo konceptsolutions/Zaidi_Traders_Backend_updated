@@ -653,4 +653,39 @@ class ItemInventoryController extends Controller
             'getRate' => $getRate,
         ];
     }
+
+    public function updateBatchInfo(Request $request)
+    {
+        $rules = array(
+            'item_id' => 'required|int',
+            'manufacture_id' => 'required|int',
+            'old_batch_no' => 'required|string',
+            'old_expiry_date' => 'required|date',
+            'new_batch_no' => 'required|string',
+            'new_expiry_date' => 'required|date',
+        );
+
+        $validator = Validator::make($request->all(), $rules);
+        if ($validator->fails()) {
+            return ['status' => 'error', 'message' => $validator->errors()->first()];
+        }
+
+        try {
+            // Update only item_inventory table
+            DB::table('item_inventory')
+                ->where('item_id', $request->item_id)
+                ->where('manufacture_id', $request->manufacture_id)
+                ->where('batch_no', $request->old_batch_no)
+                ->where('expiry_date', $request->old_expiry_date)
+                ->update([
+                    'batch_no' => $request->new_batch_no,
+                    'expiry_date' => $request->new_expiry_date,
+                ]);
+
+            return ['status' => 'ok', 'message' => 'Batch information updated successfully in inventory'];
+        } catch (\Exception $e) {
+            $message = CustomErrorMessages::getCustomMessage($e);
+            return ['status' => 'error', 'message' => $message];
+        }
+    }
 }

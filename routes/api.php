@@ -1369,6 +1369,7 @@ Route::get('getNotifications', [ItemInventoryController::class, 'getNotification
 Route::post('disposeExpiredStock', [ItemInventoryController::class, 'disposeExpiredStock']);
 
 Route::get('getAdjustItemId', [ItemInventoryController::class, 'getAdjustItemId']);
+Route::post('updateBatchInfo', [ItemInventoryController::class, 'updateBatchInfo']);
 
 //-----------------------Item Routes Start----------------
 Route::get('getItemTypeDropDown', [ItemTypeController::class, 'getItemTypeDropDown']);

@@ -9,7 +9,7 @@ use Illuminate\Database\Eloquent\SoftDeletes;
 class Invoice extends Model
 {
     use HasFactory, SoftDeletes;
-    protected $fillable = ['customer_id', 'sales_rep_id', 'sale_type', 'tax_type', 'is_approved', 'invoice_no', 'walk_in_customer_name', 'walk_in_customer_phone', 'date', 'remarks', 'store_id', 'total_amount', 'amount_received', 'bank_amount_received', 'discount', 'total_after_discount', 'gst', 'gst_percentage', 'adv_tax_percentage', 'adv_tax', 'total_after_gst', 'quotation_id', 'po_id', 'account_id', 'is_dummy', 'bank_account_id', 'deleted_at'];
+    protected $fillable = ['customer_id', 'sales_rep_id', 'sale_type', 'tax_type', 'is_approved', 'invoice_no', 'walk_in_customer_name', 'walk_in_customer_phone', 'date', 'remarks', 'store_id', 'total_amount', 'amount_received', 'payment_status', 'bank_amount_received', 'discount', 'total_after_discount', 'gst', 'gst_percentage', 'adv_tax_percentage', 'adv_tax', 'total_after_gst', 'quotation_id', 'po_id', 'account_id', 'is_dummy', 'bank_account_id', 'deleted_at'];
 
     protected static function boot()
     {

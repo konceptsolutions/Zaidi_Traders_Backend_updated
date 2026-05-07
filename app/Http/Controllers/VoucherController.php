@@ -3,9 +3,7 @@
 namespace App\Http\Controllers;
 
 use App\Models\Land;
-use App\Models\Plot;
 use App\Models\Person;
-use App\Models\Booking;
 use App\Models\Invoice;
 use App\Models\Voucher;
 use App\Models\CoaAccount;
@@ -17,6 +15,7 @@ use App\Models\VoucherTransaction;
 use Illuminate\Support\Facades\DB;
 use App\Models\PurchaseInstallment;
 use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\Log;
 use App\Models\EditedVoucherTransaction;
 use App\Models\VoucherTransactionInvoice;
 use Illuminate\Support\Facades\Validator;
@@ -28,7 +27,7 @@ class VoucherController extends Controller
     /**
      * Display a listing of the resource.
      *
-     * @param \Illuminate\Http\Request type
+     * @param \Illuminate\Http\Request $req
      * @return \Illuminate\Http\Response
      */
     public function index(Request $req)
@@ -149,18 +148,7 @@ class VoucherController extends Controller
     /**
      * Store a newly created voucher in storage.
      *
-     * @param \Illuminate\Http\Request type
-     * @param \Illuminate\Http\Request voucher_no
-     * @param \Illuminate\Http\Request date
-     * @param \Illuminate\Http\Request total_amount
-     * @param \Illuminate\Http\Request cheque_no
-     * @param \Illuminate\Http\Request file_id(optional)
-     * @param \Illuminate\Http\Request stage_id(optional)
-     * @param \Illuminate\Http\Request transaction_array
-     * @param \Illuminate\Http\Request debit_account_id
-     * @param \Illuminate\Http\Request credit_account_id
-     * @param \Illuminate\Http\Request amount
-     * @param \Illuminate\Http\Request description
+     * @param \Illuminate\Http\Request $req
      * @return \Illuminate\Http\Response message
      * @return \Illuminate\Http\Response status
      */
@@ -255,7 +243,7 @@ class VoucherController extends Controller
     /**
      * Displaying voucher details
      *
-     * @param \Illuminate\Http\Request voucher_id
+     * @param \Illuminate\Http\Request $req
      * @return \Illuminate\Http\Response
      */
     public function getVoucherDetails(Request $req)
@@ -272,7 +260,7 @@ class VoucherController extends Controller
     /**
      * Approve or unapprove voucher
      *
-     * @param \Illuminate\Http\Request voucher_id
+     * @param \Illuminate\Http\Request $req
      * @return \Illuminate\Http\Response
      */
     public function approveOrUnapproveVoucher(Request $req)
@@ -294,7 +282,7 @@ class VoucherController extends Controller
             if ($Voucher->type == 7) {
                 $VoucherTransaction = VoucherTransaction::where([['voucher_id', $Voucher->id], ['plot_id', '!=', null]])->first();
                 if ($VoucherTransaction) {
-                    Plot::where('id', $VoucherTransaction->plot_id)->update(['is_approved' => $isApproved]);
+                    // Plot::where('id', $VoucherTransaction->plot_id)->update(['is_approved' => $isApproved]);
                 }
             }
             $message = $Voucher->isApproved == 1 ? 'Unapproved' : 'Approved';
@@ -308,7 +296,7 @@ class VoucherController extends Controller
     /**
      * Deleting voucher
      *
-     * @param \Illuminate\Http\Request voucher_id
+     * @param \Illuminate\Http\Request $req
      * @return \Illuminate\Http\Response
      */
     public function update(Request $req)
@@ -449,7 +437,7 @@ class VoucherController extends Controller
     /**
      * Deleting voucher
      *
-     * @param \Illuminate\Http\Request voucher_id
+     * @param \Illuminate\Http\Request $req
      * @return \Illuminate\Http\Response
      */
     public function delete(Request $req)
@@ -479,7 +467,7 @@ class VoucherController extends Controller
     /**
      * editing voucher
      *
-     * @param \Illuminate\Http\Request voucher_id
+     * @param \Illuminate\Http\Request $req
      * @return \Illuminate\Http\Response
      */
     public function edit(Request $req)
@@ -644,7 +632,7 @@ class VoucherController extends Controller
     /**
      * Getting land transactions
      *
-     * @param \Illuminate\Http\Request land_id
+     * @param \Illuminate\Http\Request $req
      * @return \Illuminate\Http\Response
      */
     public function getLandTransactions(Request $req)
@@ -686,7 +674,7 @@ class VoucherController extends Controller
     /**
      * Getting land transactions
      *
-     * @param \Illuminate\Http\Request date
+     * @param \Illuminate\Http\Request $req
      * @return \Illuminate\Http\Response
      */
     public function getPaymentSchedule(Request $req)
@@ -758,7 +746,7 @@ class VoucherController extends Controller
     /**
      * Getting land transactions
      *
-     * @param \Illuminate\Http\Request land_id
+     * @param \Illuminate\Http\Request $req
      * @return \Illuminate\Http\Response
      */
     public function getReceivableSchedule(Request $req)
@@ -842,7 +830,7 @@ class VoucherController extends Controller
     /**
      * Display a listing of the resource.
      *
-     * @param \Illuminate\Http\Request type
+     * @param \Illuminate\Http\Request $req
      * @return \Illuminate\Http\Response
      */
     public function index2(Request $req)
@@ -974,18 +962,7 @@ class VoucherController extends Controller
     /**
      * Store a newly created voucher in storage.
      *
-     * @param \Illuminate\Http\Request type
-     * @param \Illuminate\Http\Request voucher_no
-     * @param \Illuminate\Http\Request date
-     * @param \Illuminate\Http\Request total_amount
-     * @param \Illuminate\Http\Request cheque_no
-     * @param \Illuminate\Http\Request file_id(optional)
-     * @param \Illuminate\Http\Request stage_id(optional)
-     * @param \Illuminate\Http\Request transaction_array
-     * @param \Illuminate\Http\Request debit_account_id
-     * @param \Illuminate\Http\Request credit_account_id
-     * @param \Illuminate\Http\Request amount
-     * @param \Illuminate\Http\Request description
+     * @param \Illuminate\Http\Request $req
      * @return \Illuminate\Http\Response message
      * @return \Illuminate\Http\Response status
      */
@@ -1052,12 +1029,13 @@ class VoucherController extends Controller
 
     public function invoicePaymentVoucher(Request $req)
     {
+        Log::info("invoicePaymentVoucher called", $req->all());
         $rules = array(
             'customer_id' => 'required',
-            'amount' => 'required|int',
+            'amount' => 'required|numeric',
             'invoice_id' => 'required',
             'date' => 'required',
-            'account_id' => 'required|int'
+            'account_id' => 'required|numeric'
         );
         $validator = Validator::make($req->all(), $rules);
         if ($validator->fails()) {
@@ -1143,7 +1121,60 @@ class VoucherController extends Controller
             $voucherTransaction2->save();
 
 
-            foreach ($req->invoice_id as $invoice_id) {
+            $remainingAmount = (float) $req->amount;
+            $invoiceIds = $req->invoice_id;
+            $lastInvoiceId = end($invoiceIds);
+
+            foreach ($invoiceIds as $invoice_id) {
+                $invoice = Invoice::find($invoice_id);
+                if (!$invoice) {
+                    Log::warning("Invoice not found during payment voucher creation", ['invoice_id' => $invoice_id]);
+                    continue;
+                }
+
+                $totalPayable = (float) ($invoice->total_after_adv_tax > 0 ? $invoice->total_after_adv_tax : $invoice->total_after_gst);
+                $alreadyPaid = (float) (($invoice->amount_received ?? 0) + ($invoice->bank_amount_received ?? 0));
+                $due = max(0.0, $totalPayable - $alreadyPaid);
+
+                // Determine how much of the current voucher applies to this invoice
+                $currentVoucherPayment = 0.0;
+                if ($remainingAmount > 0) {
+                    $currentVoucherPayment = ($invoice_id == $lastInvoiceId) ? $remainingAmount : min($remainingAmount, $due);
+                    $remainingAmount -= $currentVoucherPayment;
+                }
+
+                // Calculate all PREVIOUS payments made via vouchers for this invoice
+                $previouslyPaidViaVouchers = DB::table('voucher_transaction_invoices')
+                    ->join('vouchers', 'voucher_transaction_invoices.voucher_id', '=', 'vouchers.id')
+                    ->where('voucher_transaction_invoices.invoice_id', $invoice_id)
+                    ->where('vouchers.deleted_at', null)
+                    ->sum('vouchers.total_amount');
+
+                // Total = Current Voucher + Previous Vouchers + Initial Received Amounts
+                $totalPaidWithVoucher = $alreadyPaid + $previouslyPaidViaVouchers + $currentVoucherPayment;
+
+                $oldStatus = $invoice->payment_status;
+                if ($totalPaidWithVoucher >= $totalPayable && $totalPayable > 0) {
+                    $invoice->payment_status = 'paid';
+                } elseif ($totalPaidWithVoucher > 0) {
+                    $invoice->payment_status = 'partial_paid';
+                } else {
+                    $invoice->payment_status = 'unpaid';
+                }
+
+                Log::info("Payment Status Update Log", [
+                    'invoice_id' => $invoice_id,
+                    'totalPayable' => $totalPayable,
+                    'alreadyPaid' => $alreadyPaid,
+                    'previouslyPaidVouchers' => $previouslyPaidViaVouchers,
+                    'currentVoucher' => $currentVoucherPayment,
+                    'totalPaidSum' => $totalPaidWithVoucher,
+                    'oldStatus' => $oldStatus,
+                    'newStatus' => $invoice->payment_status
+                ]);
+
+                $invoice->save();
+
                 VoucherTransactionInvoice::create([
                     'voucher_id' => $voucher_id,
                     'invoice_id' => $invoice_id,
@@ -1160,10 +1191,10 @@ class VoucherController extends Controller
     {
         $rules = array(
             'supplier_id' => 'required',
-            'amount' => 'required|int',
+            'amount' => 'required|numeric',
             'po_id' => 'required',
             'date' => 'required',
-            'account_id' => 'required|int'
+            'account_id' => 'required|numeric'
         );
         $validator = Validator::make($req->all(), $rules);
         if ($validator->fails()) {
@@ -1263,8 +1294,7 @@ class VoucherController extends Controller
     /**
      * Clearing or rejecting post dated vouchers
      *
-     * @param \Illuminate\Http\Request voucher_id
-     * @param \Illuminate\Http\Request is_post_dated
+     * @param \Illuminate\Http\Request $req
      * @return \Illuminate\Http\Response
      */
     public function clearPostDatedVoucher(Request $req)

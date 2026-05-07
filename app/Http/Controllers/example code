@@ -9,7 +9,7 @@ use App\Models\InvoiceChild;
 use App\Models\InvoiceReturn;
 use App\Models\Item;
 use App\Models\ItemInventory;
-use App\Models\ItemOemPartModeles;
+
 use App\Models\Land;
 use App\Models\Person;
 use App\Models\PurchaseOrder;
@@ -68,7 +68,7 @@ class InvoiceController extends Controller
             } elseif ($invoice_type == 4) {
                 $isDeleted = 1;
             }
-            $invoices = Invoice::with('customer', 'salesrep', 'store', 'invoiceChild')
+            $invoices = Invoice::with(['customer', 'salesrep', 'store', 'invoiceChild'])
                 ->when($walk_in_customer_name, function ($q, $walk_in_customer_name) {
                     return $q->where('walk_in_customer_name', 'LIKE', '%' . $walk_in_customer_name . '%');
                 })
@@ -135,7 +135,9 @@ class InvoiceController extends Controller
     {
         $customer_id = $req->customer_id;
 
-        $invoices = Invoice::where('customer_id', $customer_id)->get();
+        $invoices = Invoice::where('customer_id', $customer_id)
+            ->whereIn('payment_status', ['unpaid', 'partial_paid'])
+            ->get();
 
         return ['invoices' => $invoices];
     }
@@ -160,22 +162,8 @@ class InvoiceController extends Controller
 
     /**
      * Store a newly created resource in storage.
-     *@param \Illuminate\Http\Request customer_id
-     *@param \Illuminate\Http\Request walk_in_customer_name
-     *@param \Illuminate\Http\Request store_id
-     *@param \Illuminate\Http\Request total_amount
-     *@param \Illuminate\Http\Request amount_received
-     *@param \Illuminate\Http\Request date
-     *@param \Illuminate\Http\Request remarks
-     *@param \Illuminate\Http\Request childArray
-     *@param \Illuminate\Http\Request item_id
-     *@param \Illuminate\Http\Request quantity
-     *@param  \Illuminate\Http\Request batch_no
-     *@param  \Illuminate\Http\Request expiry_date
-     *@param  \Illuminate\Http\Request rate
-     *@param  \Illuminate\Http\Request sales_tax
-     *@param  \Illuminate\Http\Request amount
-     *@return \Illuminate\Http\Response
+     *@param \Illuminate\Http\Request $request
+     * @return \Illuminate\Http\Response
      */
     public function store(Request $request)
     {
@@ -257,6 +245,7 @@ class InvoiceController extends Controller
             $invoice->remarks = $request->remarks;
             $invoice->adv_tax_type = $request->adv_tax_type;
             $invoice->order_date = $request->order_date;
+
             // Set payment status
             $totalPayable = (float) (($invoice->total_after_adv_tax > 0) ? $invoice->total_after_adv_tax : $invoice->total_after_gst);
             $received = (float) (($invoice->amount_received ?? 0) + ($invoice->bank_amount_received ?? 0));
@@ -272,6 +261,21 @@ class InvoiceController extends Controller
             $invoice->save();
             $invoice_id = $invoice->id;
             $invoice_no = $invoice->invoice_no;
+
+            if ($request->has('fbr_response') && is_array($request->fbr_response)) {
+                \App\Models\FbrInvoiceResponse::create([
+                    'user_id'            => auth()->id(), // Defaults to null if no user is authenticated
+                    'invoice_id'         => $invoice_id,
+                    'invoice_no'         => $invoice_no,
+                    'fbr_invoice_number' => $request->fbr_response['invoiceNumber'] ?? null,
+                    'source_invoice_no'  => $request->fbr_response['sourceInvoiceNo'] ?? null,
+                    'dated'              => $request->fbr_response['dated'] ?? null,
+                    'status_code'        => $request->fbr_response['validationResponse']['statusCode'] ?? null,
+                    'status'             => $request->fbr_response['validationResponse']['status'] ?? null,
+                    'error'              => $request->fbr_response['validationResponse']['error'] ?? null,
+                    'invoice_statuses'   => $request->fbr_response['validationResponse']['invoiceStatuses'] ?? null,
+                ]);
+            }
 
             $remarks = " Purchase Order ";
             $supplier_coa_account_id = CoaAccount::where([['person_id', $request->customer_id]])->select('id', 'coa_group_id', 'coa_sub_group_id')->first();
@@ -309,11 +313,12 @@ class InvoiceController extends Controller
                 $invoiceChild->rate = $row['rate'];
                 $invoiceChild->cost = $row['avg_price'];
                 $invoiceChild->sales_tax = $row['sales_tax'];
-                $invoiceChild->amount = $row['rate'] * $row['quantity'];
+                $tax_per = $row['sales_tax'] ?? 0;
+                $invoiceChild->amount = ($row['rate'] * $row['quantity']) * (1 + ($tax_per / 100));
                 $invoiceChild->discount = $row['item_discount'];
                 $invoiceChild->item_discount_per = $row['item_discount_per'];
                 $invoiceChild->sNo = $row['sNo'];
-                $invoiceChild->total_amount = $row['item_total_after_discount'];
+                $invoiceChild->total_amount = $row['item_total_after_discount'] * (1 + ($tax_per / 100));
                 $invoiceChild->save();
 
                 $invoiceChild_id = $invoiceChild->id;
@@ -789,7 +794,7 @@ class InvoiceController extends Controller
         //     return ['status' => 'error', 'message' => $e->getMessage()];
         // }
     }
-    private function negativeInventoryInvoice($request)
+    private function negativeInventoryInvoice(Request $request)
     {
         $totalCashSaleVoucher = 0;
         $invoice = new Invoice();
@@ -827,15 +832,23 @@ class InvoiceController extends Controller
         $price = 0;
 
         foreach ($request->list as $row) {
-            $itemoem = ItemOemPartModeles::where('id', $row['item_id'])->first();
-            $itemoem->last_sale_price = $row['price'];
-            $itemoem->save();
+            $itemUpdate = Item::find($row['item_id']);
+            $itemUpdate->rate = $row['price'] ?? $row['rate'];
+            $itemUpdate->save();
+
+            $tax_per = $row['sales_tax'] ?? 0;
+            $qty = $row['quantity'] ?? ($row['qty'] ?? 0);
+            $rate = $row['rate'] ?? ($row['price'] ?? 0);
+            $item_total_after_discount = $row['item_total_after_discount'] ?? ($qty * $rate);
 
             $invoiceChild = new InvoiceChild();
             $invoiceChild->invoice_id = $invoice_id;
             $invoiceChild->item_id = $row['item_id'];
-            $invoiceChild->quantity = $row['qty'];
-            $invoiceChild->price = $row['price'];
+            $invoiceChild->quantity = $qty;
+            $invoiceChild->rate = $rate;
+            $invoiceChild->sales_tax = $tax_per;
+            $invoiceChild->amount = ($qty * $rate) * (1 + ($tax_per / 100));
+            $invoiceChild->total_amount = $item_total_after_discount * (1 + ($tax_per / 100));
             $invoiceChild->cost = $row['avg_price'];
             $invoiceChild->sNo = $row['sNo'];
             $invoiceChild->is_negative = 1;
@@ -896,18 +909,6 @@ class InvoiceController extends Controller
                 $invoice->bank_amount_received = $request->bank_amount_received;
                 $invoice->account_id = $request->account_id;
                 $invoice->bank_account_id = $request->bank_account_id;
-                // Set payment status
-                $totalPayable = (float) (($invoice->total_after_adv_tax > 0) ? $invoice->total_after_adv_tax : $invoice->total_after_gst);
-                $received = (float) (($invoice->amount_received ?? 0) + ($invoice->bank_amount_received ?? 0));
-
-                if ($received >= $totalPayable && $totalPayable > 0) {
-                    $invoice->payment_status = 'paid';
-                } elseif ($received > 0) {
-                    $invoice->payment_status = 'partial_paid';
-                } else {
-                    $invoice->payment_status = 'unpaid';
-                }
-
                 $invoice->save();
 
                 $invoice_id = $invoice->id;
@@ -923,10 +924,11 @@ class InvoiceController extends Controller
                     $invoiceChild->rate = $row['rate'];
                     $invoiceChild->cost = $row['avg_price'];
                     $invoiceChild->sales_tax = $row['sales_tax'];
-                    $invoiceChild->amount = $row['rate'] * $row['quantity'];
+                    $tax_per = $row['sales_tax'] ?? 0;
+                    $invoiceChild->amount = ($row['rate'] * $row['quantity']) * (1 + ($tax_per / 100));
                     $invoiceChild->discount = $row['item_discount'];
                     $invoiceChild->item_discount_per = $row['item_discount_per'];
-                    $invoiceChild->total_amount = $row['item_total_after_discount'];
+                    $invoiceChild->total_amount = $row['item_total_after_discount'] * (1 + ($tax_per / 100));
                     $invoiceChild->save();
 
                     $invoiceChild_id = $invoiceChild->id;
@@ -954,7 +956,7 @@ class InvoiceController extends Controller
     /**
      * Display the specified resource.
      *
-     * @param  int  $id
+     * @param  \Illuminate\Http\Request  $req
      * @return \Illuminate\Http\Response
      */
     public function show(Request $req)
@@ -969,14 +971,15 @@ class InvoiceController extends Controller
         }
 
         try {
-            $parentData = Invoice::with('store', 'customer', 'posale', 'quotation')->find($req->id);
+            $parentData = Invoice::with(['store', 'customer', 'posale', 'quotation'])->find($req->id);
 
             if ($parentData) {
                 $parentData->order_date = $parentData->order_date ?? '';
             }
-            $childData = InvoiceChild::with('item', 'manufacturer')->where('invoice_id', $req->id)->get();
+            $childData = InvoiceChild::with(['item', 'manufacturer'])->where('invoice_id', $req->id)->get();
+            $fbrResponse = \App\Models\FbrInvoiceResponse::where('invoice_id', $req->id)->first();
 
-            return ['status' => 'success', 'parentData' => $parentData, 'childData' => $childData];
+            return ['status' => 'success', 'parentData' => $parentData, 'childData' => $childData, 'fbrResponse' => $fbrResponse];
         } catch (\Exception $e) {
             return ['status' => 'error', 'message' => $e->getMessage()];
         }
@@ -985,7 +988,7 @@ class InvoiceController extends Controller
     /**
      * Show the form for editing the specified resource.
      *
-     * @param  int  $id
+     * @param  \Illuminate\Http\Request  $req
      * @return \Illuminate\Http\Response
      */
     public function edit(Request $req)
@@ -998,12 +1001,12 @@ class InvoiceController extends Controller
             return ['status' => 'error', 'message' => $validator->errors()->first()];
         }
         // try {
-        $parentData = Invoice::with('customer', 'store')->where(['id' => $req->id])->first();
+        $parentData = Invoice::with(['customer', 'store'])->where(['id' => $req->id])->first();
         //  return $parentData->shop;
         if ($parentData->is_approved == 1) {
             return ['status' => "error", 'message' => "Approved Invoice Con't Edit"];
         } else {
-            $childData = InvoiceChild::with('item')->where('invoice_id', $req->id)->get();
+            $childData = InvoiceChild::with(['item'])->where('invoice_id', $req->id)->get();
 
             $childDataList = [];
             for ($i = 0; $i < count($childData); $i++) {
@@ -1011,7 +1014,7 @@ class InvoiceController extends Controller
 
                 $AvgPrice = PurchaseOrderChild::getStoredAveragePrice($childData[$i]->item_id);
                 $batchOptions = [];
-                $items = Item::with('iteminventory')->where('id', $childData[$i]->item_id)->orderBy('id')->first();
+                $items = Item::with(['iteminventory'])->where('id', $childData[$i]->item_id)->orderBy('id')->first();
                 foreach ($items->iteminventory as $iteminventory) {
                     $batchOptions[] = array(
                         'id' => $iteminventory->manufacture->id . $iteminventory->batch_no,
@@ -1025,7 +1028,7 @@ class InvoiceController extends Controller
                     );
                 }
 
-                $itemsInv = Item::with('itemAvaiableInventory')->where('id', $childData[$i]->item_id)->first();
+                $itemsInv = Item::with(['itemAvaiableInventory'])->where('id', $childData[$i]->item_id)->first();
 
                 if ($itemsInv && $itemsInv->itemAvaiableInventory) {
 
@@ -1034,7 +1037,7 @@ class InvoiceController extends Controller
                     $qty_available = 0;
                 }
 
-                $selectedBatch = ItemInventory::with('manufacture', 'item2')->where('invoice_id', $childData[$i]->id)->orderBy('id')->first();
+                $selectedBatch = ItemInventory::with(['manufacture', 'item2'])->where('invoice_id', $childData[$i]->id)->orderBy('id')->first();
 
                 $batchDetails = new stdClass;
                 $batchDetails->batchExpiry = $selectedBatch ? $selectedBatch->expiry_date : '';
@@ -1044,7 +1047,7 @@ class InvoiceController extends Controller
 
                 $selectedBatch = $selectedBatch !== null ? $selectedBatch->id . $selectedBatch->batch_no : '';
 
-                $selectedBatch = ItemInventory::with('manufacture', 'item2')->where('invoice_id', $childData[$i]->id)->orderBy('id')->first();
+                $selectedBatch = ItemInventory::with(['manufacture', 'item2'])->where('invoice_id', $childData[$i]->id)->orderBy('id')->first();
                 if ($selectedBatch && $selectedBatch->manufacture) {
                     $selectedBatch2 = new stdClass();
 
@@ -1131,7 +1134,6 @@ class InvoiceController extends Controller
      * Update the specified resource in storage.
      *
      * @param  \Illuminate\Http\Request  $request
-     * @param  int  $id
      * @return \Illuminate\Http\Response
      */
     public function update(Request $request)
@@ -1183,6 +1185,7 @@ class InvoiceController extends Controller
             $invoice->is_dummy = 0;
             $invoice->adv_tax_type = $request->adv_tax_type;
             $invoice->order_date = $request->order_date;
+
             // Calculate total paid including existing vouchers
             $totalPayable = (float) (($invoice->total_after_adv_tax > 0) ? $invoice->total_after_adv_tax : $invoice->total_after_gst);
             $initialReceived = (float) (($invoice->amount_received ?? 0) + ($invoice->bank_amount_received ?? 0));
@@ -1323,6 +1326,7 @@ class InvoiceController extends Controller
                     ItemInventory::where('invoice_id', $ItemInventory->id)->delete();
                 }
             }
+            $invChildIds = [];
             foreach ($request->childArray as $row) {
 
                 if (isset($row['id'])) {
@@ -1337,11 +1341,12 @@ class InvoiceController extends Controller
                 $invoiceChild->rate = $row['rate'];
                 $invoiceChild->cost = $row['avg_price'];
                 $invoiceChild->sales_tax = $row['sales_tax'];
-                $invoiceChild->amount = $row['rate'] * $row['quantity'];
+                $tax_per = $row['sales_tax'] ?? 0;
+                $invoiceChild->amount = ($row['rate'] * $row['quantity']) * (1 + ($tax_per / 100));
                 $invoiceChild->discount = $row['item_discount'];
                 $invoiceChild->sNo = $row['sNo'];
                 $invoiceChild->item_discount_per = $row['item_discount_per'] ?? 0;
-                $invoiceChild->total_amount = $row['item_total_after_discount'];
+                $invoiceChild->total_amount = $row['item_total_after_discount'] * (1 + ($tax_per / 100));
                 $invoiceChild->save();
                 $invoiceChild_id = $invoiceChild->id;
                 $invChildIds[] = $invoiceChild->id;
@@ -1364,10 +1369,10 @@ class InvoiceController extends Controller
                 $stockChilddata->is_dummy = 0;
                 $stockChilddata->save();
 
-                $PurchasePrice = PurchaseOrderChild::with('item')->where('item_id', $row['item_id'])->groupby('item_id')->select(DB::raw('SUM(rate*quantity) / (SUM(quantity)) as AvgPrice'), 'item_id')->first();
+                $PurchasePrice = PurchaseOrderChild::with(['item'])->where('item_id', $row['item_id'])->groupby('item_id')->select(DB::raw('SUM(rate*quantity) / (SUM(quantity)) as AvgPrice'), 'item_id')->first();
                 $itemName = $PurchasePrice->item->name ?? '';
 
-                $PurchasePrice = PurchaseOrderChild::with('item')
+                $PurchasePrice = PurchaseOrderChild::with(['item'])
                     ->where('item_id', $row['item_id'])
                     ->groupBy('item_id')
                     ->select(DB::raw('SUM(rate * quantity) / SUM(quantity) as AvgPrice'), 'item_id')
@@ -1378,7 +1383,7 @@ class InvoiceController extends Controller
                     $itemName = $PurchasePrice->item->name ?? '';
                 } else {
                     // If not found in PurchaseOrderChild, check AdjustInventoryChild
-                    $PurchasePrice = AdjustInventoryChild::with('item')
+                    $PurchasePrice = AdjustInventoryChild::with(['item'])
                         ->where('item_id', $row['item_id'])
                         ->groupBy('item_id')
                         ->select(DB::raw('SUM(purchase_price * quantity_in) / SUM(quantity_in) as AvgPrice'), 'item_id')
@@ -1444,7 +1449,7 @@ class InvoiceController extends Controller
                 $voucherRevenueGenid = $voucherRevenueGen->id;
                 $voucherRevGen_id = $voucherRevenueGen->id;
                 foreach ($request->childArray as $list) {
-                    $PurchasePrice = PurchaseOrderChild::with('item')->where('item_id', $list['item_id'])->groupby('item_id')->select(DB::raw('SUM(rate*quantity) / (SUM(quantity)) as AvgPrice'), 'item_id')->first();
+                    $PurchasePrice = PurchaseOrderChild::with(['item'])->where('item_id', $list['item_id'])->groupby('item_id')->select(DB::raw('SUM(rate*quantity) / (SUM(quantity)) as AvgPrice'), 'item_id')->first();
 
                     $itemName = $PurchasePrice->item->name ?? '';
                     //---------------------Crediting Reneve ------------------
@@ -1555,10 +1560,10 @@ class InvoiceController extends Controller
 
                 foreach ($request->childArray as $list) {
                     $price += $list['rate'] * $list['quantity'];
-                    $PurchasePrice = PurchaseOrderChild::with('item')->where('item_id', $row['item_id'])->groupby('item_id')->select(DB::raw('SUM(rate*quantity) / (SUM(quantity)) as AvgPrice'), 'item_id')->first();
+                    $PurchasePrice = PurchaseOrderChild::with(['item'])->where('item_id', $row['item_id'])->groupby('item_id')->select(DB::raw('SUM(rate*quantity) / (SUM(quantity)) as AvgPrice'), 'item_id')->first();
                     $itemName = $PurchasePrice->item->name ?? '';
 
-                    $PurchasePrice = PurchaseOrderChild::with('item')
+                    $PurchasePrice = PurchaseOrderChild::with(['item'])
                         ->where('item_id', $row['item_id'])
                         ->groupBy('item_id')
                         ->select(DB::raw('SUM(rate * quantity) / SUM(quantity) as AvgPrice'), 'item_id')
@@ -1569,7 +1574,7 @@ class InvoiceController extends Controller
                         $itemName = $PurchasePrice->item->name ?? '';
                     } else {
                         // If not found in PurchaseOrderChild, check AdjustInventoryChild
-                        $PurchasePrice = AdjustInventoryChild::with('item')
+                        $PurchasePrice = AdjustInventoryChild::with(['item'])
                             ->where('item_id', $row['item_id'])
                             ->groupBy('item_id')
                             ->select(DB::raw('SUM(purchase_price * quantity_in) / SUM(quantity_in) as AvgPrice'), 'item_id')
@@ -1883,26 +1888,6 @@ class InvoiceController extends Controller
                 $invoice->account_id = $request->account_id;
                 $invoice->bank_account_id = $request->bank_account_id;
 
-                // Calculate total paid including existing vouchers
-                $totalPayable = (float) (($invoice->total_after_adv_tax > 0) ? $invoice->total_after_adv_tax : $invoice->total_after_gst);
-                $initialReceived = (float) (($invoice->amount_received ?? 0) + ($invoice->bank_amount_received ?? 0));
-
-                $previouslyPaidViaVouchers = DB::table('voucher_transaction_invoices')
-                    ->join('vouchers', 'voucher_transaction_invoices.voucher_id', '=', 'vouchers.id')
-                    ->where('voucher_transaction_invoices.invoice_id', $invoice->id)
-                    ->where('vouchers.deleted_at', null)
-                    ->sum('vouchers.total_amount');
-
-                $totalPaidSum = $initialReceived + $previouslyPaidViaVouchers;
-
-                if ($totalPaidSum >= $totalPayable && $totalPayable > 0) {
-                    $invoice->payment_status = 'paid';
-                } elseif ($totalPaidSum > 0) {
-                    $invoice->payment_status = 'partial_paid';
-                } else {
-                    $invoice->payment_status = 'unpaid';
-                }
-
                 $invoice->save();
                 $invoice_id = $invoice->id;
                 $invoiceChilddata = InvoiceChild::where('invoice_id', $request->id)->get();
@@ -1925,10 +1910,11 @@ class InvoiceController extends Controller
                     $invoiceChild->rate = $row['rate'];
                     $invoiceChild->cost = $row['avg_price'];
                     $invoiceChild->sales_tax = $row['sales_tax'];
-                    $invoiceChild->amount = $row['rate'] * $row['quantity'];
+                    $tax_per = $row['sales_tax'] ?? 0;
+                    $invoiceChild->amount = ($row['rate'] * $row['quantity']) * (1 + ($tax_per / 100));
                     $invoiceChild->discount = $row['item_discount'];
                     $invoiceChild->item_discount_per = $row['item_discount_per'];
-                    $invoiceChild->total_amount = $row['item_total_after_discount'];
+                    $invoiceChild->total_amount = $row['item_total_after_discount'] * (1 + ($tax_per / 100));
                     $invoiceChild->save();
                     $invoiceChild_id = $invoiceChild->id;
                     $invChildIds[] = $invoiceChild->id;
@@ -1963,7 +1949,7 @@ class InvoiceController extends Controller
     /**
      * Remove the specified resource from storage.
      *
-     * @param  int  $id
+     * @param  \Illuminate\Http\Request  $request
      * @return \Illuminate\Http\Response
      */
     public function destroy(Request $request)
@@ -2092,13 +2078,13 @@ class InvoiceController extends Controller
     /**
      *  Invoice Details for table.
      *
-     * @param  int  $id
+     * @param  \Illuminate\Http\Request  $req
      * @return \Illuminate\Http\Response
      */
     public function getSalesDetails(Request $req)
     {
         try {
-            $invoices = InvoiceChild::with('invoiceNo', 'item')
+            $invoices = InvoiceChild::with(['invoiceNo', 'item'])
                 ->get();
             return ['invoices_child' => $invoices];
         } catch (\Exception $e) {
@@ -2108,10 +2094,7 @@ class InvoiceController extends Controller
 
     /**
      * Sales Report.
-     * @param  \Illuminate\Http\Request  $sale_type
-     * @param  \Illuminate\Http\Request  $walk_in_customer_name
-     * @param  \Illuminate\Http\Request  $customer_id
-     * @param  \Illuminate\Http\Request  $item_id
+     * @param  \Illuminate\Http\Request  $req
      * @return \Illuminate\Http\Response
      */
     public function getSalesReport(Request $req)
@@ -2164,12 +2147,7 @@ class InvoiceController extends Controller
 
     /**
      * Manufacturewise Report.
-     * @param  \Illuminate\Http\Request  $sale_type
-     * @param  \Illuminate\Http\Request  $walk_in_customer_name
-     * @param  \Illuminate\Http\Request  $customer_id
-     * @param  \Illuminate\Http\Request  $manufacturer_id
-     * @param  \Illuminate\Http\Request  $from
-     * @param  \Illuminate\Http\Request  $to
+     * @param  \Illuminate\Http\Request  $req
      * @return \Illuminate\Http\Response
      */
 
@@ -2237,10 +2215,7 @@ public function getSalesReportManufacturewise(Request $req)
 
     /**
      * Customer Wise Sales Report.
-     * @param  \Illuminate\Http\Request  $sale_type
-     * @param  \Illuminate\Http\Request  $customer_id
-     * @param  \Illuminate\Http\Request  $from
-     * @param  \Illuminate\Http\Request  $to
+     * @param  \Illuminate\Http\Request  $req
      * @return \Illuminate\Http\Response
      */
 
@@ -2308,7 +2283,7 @@ public function getSalesReportManufacturewise(Request $req)
         $from = $req->from_date;
         $to = $req->to_date;
         try {
-            $invoices = Person::with('salesRepInvoice', 'personType')
+            $invoices = Person::with(['salesRepInvoice', 'personType'])
                 ->when($from, function ($query, $from) use ($to) {
                     $query->whereHas('salesRepInvoice', function ($query) use ($from, $to) {
                         $query->whereBetween('date', [$from, $to]);
@@ -2350,11 +2325,11 @@ public function getSalesReportManufacturewise(Request $req)
         try {
             $invoice_id = $req->id;
 
-            $parentData = Invoice::with('store', 'customer', 'posale', 'quotation')->find($req->id);
+            $parentData = Invoice::with(['store', 'customer', 'posale', 'quotation'])->find($req->id);
 
-            $childData = InvoiceChild::with('item', 'manufacturer')->where('invoice_id', $req->id)->get();
+            $childData = InvoiceChild::with(['item', 'manufacturer'])->where('invoice_id', $req->id)->get();
             // $parentData->$childData = $childData;
-            $Salehistory = InvoiceReturn::with('invoice', 'invoiceChild')
+            $Salehistory = InvoiceReturn::with(['invoice', 'invoiceChild'])
                 ->where('invoice_id', $invoice_id)
                 ->get();
             $parentData->childData = $childData;
