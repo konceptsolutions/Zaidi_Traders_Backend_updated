@@ -135,7 +135,9 @@ class InvoiceController extends Controller
     {
         $customer_id = $req->customer_id;
 
-        $invoices = Invoice::where('customer_id', $customer_id)->get();
+        $invoices = Invoice::where('customer_id', $customer_id)
+            ->whereIn('payment_status', ['partial_paid', 'unpaid'])
+            ->get();
 
         return ['invoices' => $invoices];
     }
