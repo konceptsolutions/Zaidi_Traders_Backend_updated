@@ -2264,46 +2264,54 @@ public function getSalesReportManufacturewise(Request $req)
     $to = $req->to_date;
 
     try {
+        // Filter for sale invoices (by invoice date)
+        $saleInvoiceFilter = function ($q) use ($sale_type, $customer_id, $from, $to) {
+            if ($sale_type) {
+                $q->where('sale_type', $sale_type);
+            }
+            if ($customer_id) {
+                $q->where('customer_id', $customer_id);
+            }
+            if ($from && $to) {
+                $q->whereBetween('date', [$from, $to]);
+            }
+        };
+
+        // Filter for return invoices (by return_date, parent invoice for sale_type/customer)
+        $returnInvoiceFilter = function ($q) use ($sale_type, $customer_id, $from, $to) {
+            if ($from && $to) {
+                $q->whereBetween('return_date', [$from, $to]);
+            }
+            if ($sale_type || $customer_id) {
+                $q->whereHas('invoice', function ($q2) use ($sale_type, $customer_id) {
+                    if ($sale_type) {
+                        $q2->where('sale_type', $sale_type);
+                    }
+                    if ($customer_id) {
+                        $q2->where('customer_id', $customer_id);
+                    }
+                });
+            }
+        };
+
         $manufacturers = Person::whereHas('personType', function ($q) {
                 $q->where('id', 3); // Manufacturer
             })
-            ->whereHas('itemManufacture.invoiceChild.invoice', function ($q) use ($sale_type, $customer_id, $from, $to) {
-                if ($sale_type) {
-                    $q->where('sale_type', $sale_type);
-                }
-                if ($customer_id) {
-                    $q->where('customer_id', $customer_id);
-                }
-                if ($from && $to) {
-                    $q->whereBetween('date', [$from, $to]);
-                }
+            ->where(function ($q) use ($saleInvoiceFilter, $returnInvoiceFilter) {
+                $q->whereHas('itemManufacture.invoiceChild.invoice', $saleInvoiceFilter)
+                    ->orWhereHas('itemManufacture.invoiceChildReturn.invoice', $returnInvoiceFilter);
             })
             ->when(!empty($manufacture_ids), function ($q) use ($manufacture_ids) {
                 $q->whereIn('id', $manufacture_ids);
             })
-            ->with(['itemManufacture' => function ($q) use ($sale_type, $customer_id, $from, $to) {
-                $q->with(['invoiceChild' => function ($q) use ($sale_type, $customer_id, $from, $to) {
-                    $q->whereHas('invoice', function ($q) use ($sale_type, $customer_id, $from, $to) {
-                        if ($sale_type) {
-                            $q->where('sale_type', $sale_type);
-                        }
-                        if ($customer_id) {
-                            $q->where('customer_id', $customer_id);
-                        }
-                        if ($from && $to) {
-                            $q->whereBetween('date', [$from, $to]);
-                        }
-                    })->with(['invoice' => function ($q) use ($sale_type, $customer_id, $from, $to) {
-                        if ($sale_type) {
-                            $q->where('sale_type', $sale_type);
-                        }
-                        if ($customer_id) {
-                            $q->where('customer_id', $customer_id);
-                        }
-                        if ($from && $to) {
-                            $q->whereBetween('date', [$from, $to]);
-                        }
-                    }]);
+            ->with(['itemManufacture' => function ($q) use ($saleInvoiceFilter, $returnInvoiceFilter) {
+                $q->with(['invoiceChild' => function ($q) use ($saleInvoiceFilter) {
+                    $q->whereHas('invoice', $saleInvoiceFilter)
+                        ->with(['invoice' => $saleInvoiceFilter]);
+                }]);
+                $q->with(['invoiceChildReturn' => function ($q) use ($returnInvoiceFilter) {
+                    $q->whereHas('invoice', $returnInvoiceFilter)
+                        ->with(['invoice' => $returnInvoiceFilter]);
                 }]);
             }, 'personType'])
             ->get();

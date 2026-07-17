@@ -49,4 +49,10 @@ class ItemManufacture extends Model
         return $this->hasMany(InvoiceChild::class,  'item_id', 'item_id')
             ->with('invoice', 'item');
     }
+
+    public function invoiceChildReturn()
+    {
+        return $this->hasMany(InvoiceChildReturn::class, 'item_id', 'item_id')
+            ->with('invoice', 'item');
+    }
 }
