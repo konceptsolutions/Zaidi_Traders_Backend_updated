@@ -1232,6 +1232,17 @@ Route::get('getPoBySupplier', [InvoiceController::class, 'getPoBySupplier']);
 Route::get('getSalesReportManufacturewise', [InvoiceController::class, 'getSalesReportManufacturewise']);
 
 /**
+ * Manufacturewise Sales Summary Report.
+ * @param  \Illuminate\Http\Request  $sale_type
+ * @param  \Illuminate\Http\Request  $customer_id
+ * @param  \Illuminate\Http\Request  $manufacture_id
+ * @param  \Illuminate\Http\Request  $from_date
+ * @param  \Illuminate\Http\Request  $to_date
+ * @return \Illuminate\Http\Response
+ */
+Route::get('getSalesSummaryReport', [InvoiceController::class, 'getSalesSummaryReport']);
+
+/**
  * Customer Wise Sales Report.
  * @param  \Illuminate\Http\Request  $sale_type
  * @param  \Illuminate\Http\Request  $customer_id

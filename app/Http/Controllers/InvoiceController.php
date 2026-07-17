@@ -2234,8 +2234,193 @@ public function getSalesReportManufacturewise(Request $req)
     }
 }
 
+    /**
+     * Manufacturewise Sales Summary Report.
+     * @param  \Illuminate\Http\Request  $sale_type
+     * @param  \Illuminate\Http\Request  $customer_id
+     * @param  \Illuminate\Http\Request  $manufacture_id
+     * @param  \Illuminate\Http\Request  $from_date
+     * @param  \Illuminate\Http\Request  $to_date
+     * @return \Illuminate\Http\Response
+     */
+    public function getSalesSummaryReport(Request $req)
+    {
+        $sale_type = $req->sale_type;
+        $customer_id = $req->customer_id;
+        $manufacture_ids = $req->manufacture_id ? explode(',', $req->manufacture_id) : [];
+        $from = $req->from_date;
+        $to = $req->to_date;
 
+        try {
+            $applyInvoiceFilters = function ($query) use ($sale_type, $customer_id, $from, $to) {
+                if ($sale_type) {
+                    $query->where('inv.sale_type', $sale_type);
+                }
+                if ($customer_id) {
+                    $query->where('inv.customer_id', $customer_id);
+                }
+                if ($from && $to) {
+                    $query->whereBetween('inv.date', [$from, $to]);
+                }
+            };
 
+            $applyReturnInvoiceFilters = function ($query) use ($sale_type, $customer_id) {
+                if ($sale_type) {
+                    $query->where('inv.sale_type', $sale_type);
+                }
+                if ($customer_id) {
+                    $query->where('inv.customer_id', $customer_id);
+                }
+            };
+
+            $salesRows = DB::table('invoice_children as ic')
+                ->join('invoices as inv', 'ic.invoice_id', '=', 'inv.id')
+                ->join('item_manufacture as im', 'ic.item_id', '=', 'im.item_id')
+                ->join('items as it', 'ic.item_id', '=', 'it.id')
+                ->whereNull('ic.deleted_at')
+                ->whereNull('inv.deleted_at')
+                ->when(!empty($manufacture_ids), function ($query) use ($manufacture_ids) {
+                    $query->whereIn('im.manufacture_id', $manufacture_ids);
+                })
+                ->tap($applyInvoiceFilters)
+                ->groupBy('im.manufacture_id', 'ic.item_id', 'it.name')
+                ->select(
+                    'im.manufacture_id',
+                    'ic.item_id',
+                    'it.name as item_name',
+                    DB::raw('SUM(ic.quantity) as sold_qty'),
+                    DB::raw('SUM(ic.rate * ic.quantity) as sold_rate_amount'),
+                    DB::raw('SUM(ic.cost * ic.quantity) as sold_total_cost'),
+                    DB::raw('CASE WHEN SUM(ic.quantity) > 0 THEN SUM(ic.cost * ic.quantity) / SUM(ic.quantity) ELSE 0 END as sold_avg_cost')
+                )
+                ->get();
+
+            $returnRows = DB::table('invoice_children_return as icr')
+                ->join('invoices_return as ir', 'icr.ret_invoice_id', '=', 'ir.id')
+                ->join('invoices as inv', 'ir.invoice_id', '=', 'inv.id')
+                ->join('item_manufacture as im', 'icr.item_id', '=', 'im.item_id')
+                ->join('items as it', 'icr.item_id', '=', 'it.id')
+                ->whereNull('icr.deleted_at')
+                ->whereNull('ir.deleted_at')
+                ->whereNull('inv.deleted_at')
+                ->when(!empty($manufacture_ids), function ($query) use ($manufacture_ids) {
+                    $query->whereIn('im.manufacture_id', $manufacture_ids);
+                })
+                ->tap($applyReturnInvoiceFilters)
+                ->when($from && $to, function ($query) use ($from, $to) {
+                    $query->whereBetween('ir.return_date', [$from, $to]);
+                })
+                ->groupBy('im.manufacture_id', 'icr.item_id', 'it.name')
+                ->select(
+                    'im.manufacture_id',
+                    'icr.item_id',
+                    'it.name as item_name',
+                    DB::raw('SUM(icr.quantity) as return_qty'),
+                    DB::raw('SUM(icr.rate * icr.quantity) as return_rate_amount'),
+                    DB::raw('SUM(icr.cost * icr.quantity) as return_total_cost'),
+                    DB::raw('CASE WHEN SUM(icr.quantity) > 0 THEN SUM(icr.cost * icr.quantity) / SUM(icr.quantity) ELSE 0 END as return_avg_cost')
+                )
+                ->get();
+
+            $summaryMap = [];
+
+            foreach ($salesRows as $row) {
+                $key = $row->manufacture_id . '-' . $row->item_id;
+                $summaryMap[$key] = [
+                    'manufacture_id' => (int) $row->manufacture_id,
+                    'item_id' => (int) $row->item_id,
+                    'item_name' => $row->item_name,
+                    'sold_qty' => (float) $row->sold_qty,
+                    'sold_rate_amount' => (float) $row->sold_rate_amount,
+                    'sold_invoice_rate_avg' => $row->sold_qty > 0 ? round($row->sold_rate_amount / $row->sold_qty, 2) : 0,
+                    'avg_price' => $row->sold_qty > 0 ? round($row->sold_rate_amount / $row->sold_qty, 2) : 0,
+                    'sold_avg_cost' => round((float) $row->sold_avg_cost, 2),
+                    'sold_total_cost' => round((float) $row->sold_total_cost, 2),
+                    'return_qty' => 0,
+                    'return_rate_amount' => 0,
+                    'return_invoice_rate_avg' => 0,
+                    'return_avg_cost' => 0,
+                    'return_total_cost' => 0,
+                    'return_avg_price' => 0,
+                ];
+            }
+
+            foreach ($returnRows as $row) {
+                $key = $row->manufacture_id . '-' . $row->item_id;
+                if (!isset($summaryMap[$key])) {
+                    $summaryMap[$key] = [
+                        'manufacture_id' => (int) $row->manufacture_id,
+                        'item_id' => (int) $row->item_id,
+                        'item_name' => $row->item_name,
+                        'sold_qty' => 0,
+                        'sold_rate_amount' => 0,
+                        'sold_invoice_rate_avg' => 0,
+                        'avg_price' => 0,
+                        'sold_avg_cost' => 0,
+                        'sold_total_cost' => 0,
+                        'return_qty' => 0,
+                        'return_rate_amount' => 0,
+                        'return_invoice_rate_avg' => 0,
+                        'return_avg_cost' => 0,
+                        'return_total_cost' => 0,
+                        'return_avg_price' => 0,
+                    ];
+                }
+
+                $summaryMap[$key]['return_qty'] = (float) $row->return_qty;
+                $summaryMap[$key]['return_rate_amount'] = (float) $row->return_rate_amount;
+                $summaryMap[$key]['return_invoice_rate_avg'] = $row->return_qty > 0
+                    ? round($row->return_rate_amount / $row->return_qty, 2)
+                    : 0;
+                $summaryMap[$key]['return_avg_cost'] = round((float) $row->return_avg_cost, 2);
+                $summaryMap[$key]['return_total_cost'] = round((float) $row->return_total_cost, 2);
+                $summaryMap[$key]['return_avg_price'] = $row->return_qty > 0
+                    ? round($row->return_rate_amount / $row->return_qty, 2)
+                    : 0;
+            }
+
+            foreach ($summaryMap as &$item) {
+                $item['net_qty'] = round($item['sold_qty'] - $item['return_qty'], 2);
+                $item['net_rate_amount'] = round($item['sold_rate_amount'] - $item['return_rate_amount'], 2);
+                $item['net_total_cost'] = round($item['sold_total_cost'] - $item['return_total_cost'], 2);
+                $item['net_avg_price'] = $item['net_qty'] > 0
+                    ? round($item['net_rate_amount'] / $item['net_qty'], 2)
+                    : 0;
+                $item['profit'] = round($item['net_rate_amount'] - $item['net_total_cost'], 2);
+                unset($item['sold_rate_amount'], $item['return_rate_amount'], $item['net_rate_amount']);
+            }
+            unset($item);
+
+            $manufactureIdsInReport = collect($summaryMap)
+                ->pluck('manufacture_id')
+                ->unique()
+                ->values();
+
+            $manufacturers = Person::whereIn('id', $manufactureIdsInReport)
+                ->orderBy('name')
+                ->get(['id', 'name']);
+
+            $salesSummary = $manufacturers->map(function ($manufacturer) use ($summaryMap) {
+                $items = collect($summaryMap)
+                    ->filter(function ($item) use ($manufacturer) {
+                        return $item['manufacture_id'] === (int) $manufacturer->id;
+                    })
+                    ->values()
+                    ->sortBy('item_name')
+                    ->values();
+
+                return [
+                    'manufacture_id' => $manufacturer->id,
+                    'manufacture_name' => $manufacturer->name,
+                    'items' => $items,
+                ];
+            })->values();
+
+            return ['salesSummary' => $salesSummary];
+        } catch (\Exception $e) {
+            return ['status' => 'error', 'message' => $e->getMessage()];
+        }
+    }
 
     /**
      * Customer Wise Sales Report.
