@@ -681,6 +681,26 @@ class QuotationController extends Controller
                     $invoice->tax_type        = $request->tax_type;
                     $invoice->adv_tax        = $request->adv_tax;
                     $invoice->adv_tax_percentage        = $request->adv_tax_percentage;
+                    $invoice->adv_tax_type = $request->adv_tax_type;
+                    $invoice->total_after_adv_tax = $request->total_after_adv_tax ?? 0;
+                    $invoice->gst = $request->gst ?? 0;
+                    $invoice->gst_percentage = $request->gst_percentage ?? 0;
+                    $invoice->total_after_gst = $request->total_after_gst ?? 0;
+                    $invoice->discount = $request->discount ?? 0;
+                    $invoice->total_after_discount = $request->total_after_discount ?? 0;
+                    $invoice->wht_type = $request->wht_type ?? 1;
+                    $invoice->wht_percentage = $request->wht_percentage ?? 0;
+                    $invoice->wht_amount = $request->wht_amount ?? 0;
+                    $invoice->total_after_wht = $request->total_after_wht ?? 0;
+                    $totalPayable = Invoice::resolveTotalPayable($invoice);
+                    $received = (float) (($invoice->amount_received ?? 0) + ($invoice->bank_amount_received ?? 0));
+                    if ($received >= $totalPayable && $totalPayable > 0) {
+                        $invoice->payment_status = 'paid';
+                    } elseif ($received > 0) {
+                        $invoice->payment_status = 'partial_paid';
+                    } else {
+                        $invoice->payment_status = 'unpaid';
+                    }
                     $invoice->save();
                     $invoice_id = $invoice->id;
                     $invoice_no = $invoice->invoice_no;
@@ -904,6 +924,19 @@ class QuotationController extends Controller
                             $voucherTransaction->save();
                             $creditside += $request->adv_tax;
                         }
+                        if (($request->wht_amount ?? 0) > 0) {
+                            //------ Withholding Tax Receivable ------------
+                            $voucherTransaction = new VoucherTransaction();
+                            $voucherTransaction->voucher_id = $voucherRevGen_id;
+                            $voucherTransaction->date = date('y-m-d');
+                            $voucherTransaction->coa_account_id = 3851;
+                            $voucherTransaction->is_approved = 1;
+                            $voucherTransaction->debit = $request->wht_amount;
+                            $voucherTransaction->credit = 0;
+                            $voucherTransaction->description = "Withholding Tax  " . " ,Invoice no: " . $invoice_no;
+                            $voucherTransaction->save();
+                            $debitside += $request->wht_amount;
+                        }
                         $voucher = Voucher::find($voucherRevenueGenid);
                         $voucher->total_amount = $totalCashSaleVoucher;
                         $voucher->save();
@@ -1118,6 +1151,30 @@ class QuotationController extends Controller
                             $voucherTransaction->description = "Advance Sale Tax " .  " ,Invoice no: " . $invoice_no;
                             $voucherTransaction->save();
                             $debitside += $request->adv_tax;
+                        }
+                        if (($request->wht_amount ?? 0) > 0) {
+                            // Credit customer (WHT withheld) / Debit WHT receivable
+                            $voucherTransaction = new VoucherTransaction();
+                            $voucherTransaction->voucher_id = $voucherInvCost_id;
+                            $voucherTransaction->date = date('y-m-d');
+                            $voucherTransaction->coa_account_id = $customer_account_id;
+                            $voucherTransaction->is_approved = 1;
+                            $voucherTransaction->debit = 0;
+                            $voucherTransaction->credit = $request->wht_amount;
+                            $voucherTransaction->description = "Withholding Tax " . " ,Invoice no: " . $invoice_no;
+                            $voucherTransaction->save();
+                            $creditside += $request->wht_amount;
+
+                            $voucherTransaction = new VoucherTransaction();
+                            $voucherTransaction->voucher_id = $voucherInvCost_id;
+                            $voucherTransaction->date = date('y-m-d');
+                            $voucherTransaction->coa_account_id = 3851;
+                            $voucherTransaction->is_approved = 1;
+                            $voucherTransaction->debit = $request->wht_amount;
+                            $voucherTransaction->credit = 0;
+                            $voucherTransaction->description = "Withholding Tax " . " ,Invoice no: " . $invoice_no;
+                            $voucherTransaction->save();
+                            $debitside += $request->wht_amount;
                         }
                     }
 

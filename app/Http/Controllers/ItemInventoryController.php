@@ -465,7 +465,7 @@ class ItemInventoryController extends Controller
                 $disposestock->manufacture_id = $request->manufacture_id;
                 $disposestock->quantity_out = $request->quantity;
                 $disposestock->expiry_date = $request->expiry_date;
-                $disposestock->date = date('y-m-d');
+                $disposestock->date = $request->date ?? date('Y-m-d');
                 $disposestock->is_dummy = 0;
                 $disposestock->save();
 
@@ -501,16 +501,17 @@ class ItemInventoryController extends Controller
     {
         $debitside = 0;
         $creditside = 0;
+        $voucherDate = $request->date ?? date('Y-m-d');
         $remarks = "Disposed Stock Voucher ";
         $is_post_dated = isset($request->cheque_no) ? 1 : 0;
         $getVoucherNo = DB::table('vouchers')->where('type', 1)->orderBy('id', 'desc')->first();
         $newVoucherNo = $getVoucherNo ? $getVoucherNo->voucher_no + 1 : 1;
         $voucher = new Voucher();
         $voucher->voucher_no = $newVoucherNo;
-        $voucher->date = date('y-m-d');
+        $voucher->date = $voucherDate;
         $voucher->name =  "Disposed Stock Voucher ";
         $voucher->type = 3;
-        $voucher->generated_at = date('y-m-d');
+        $voucher->generated_at = $voucherDate;
         $voucher->total_amount = 0;
         //     $voucher->purchase_order_id = $purchase_id;
         $voucher->isApproved = 1;
@@ -525,7 +526,7 @@ class ItemInventoryController extends Controller
 
         $voucherTransaction = new VoucherTransaction();
         $voucherTransaction->voucher_id = $voucher_id;
-        $voucherTransaction->date = date('y-m-d');
+        $voucherTransaction->date = $voucherDate;
         $voucherTransaction->coa_account_id = 1;
         $voucherTransaction->debit = 0;
         $voucherTransaction->credit = ($request->quantity) * ($averagePrice);
@@ -537,7 +538,7 @@ class ItemInventoryController extends Controller
         // debiting Bad Dead Loss Expense
         $voucherTransaction = new VoucherTransaction();
         $voucherTransaction->voucher_id = $voucher_id;
-        $voucherTransaction->date = $request->request_date;
+        $voucherTransaction->date = $voucherDate;
         $voucherTransaction->coa_account_id = 1778;
         $voucherTransaction->debit = ($request->quantity) * ($averagePrice);
         $voucherTransaction->credit = 0;

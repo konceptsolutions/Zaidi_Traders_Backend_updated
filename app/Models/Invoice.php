@@ -9,7 +9,7 @@ use Illuminate\Database\Eloquent\SoftDeletes;
 class Invoice extends Model
 {
     use HasFactory, SoftDeletes;
-    protected $fillable = ['customer_id', 'sales_rep_id', 'sale_type', 'tax_type', 'is_approved', 'invoice_no', 'walk_in_customer_name', 'walk_in_customer_phone', 'date', 'remarks', 'store_id', 'total_amount', 'amount_received', 'payment_status', 'bank_amount_received', 'discount', 'total_after_discount', 'gst', 'gst_percentage', 'adv_tax_percentage', 'adv_tax', 'total_after_gst', 'quotation_id', 'po_id', 'account_id', 'is_dummy', 'bank_account_id', 'deleted_at'];
+    protected $fillable = ['customer_id', 'sales_rep_id', 'sale_type', 'tax_type', 'is_approved', 'invoice_no', 'walk_in_customer_name', 'walk_in_customer_phone', 'date', 'remarks', 'store_id', 'total_amount', 'amount_received', 'payment_status', 'bank_amount_received', 'discount', 'total_after_discount', 'gst', 'gst_percentage', 'adv_tax_percentage', 'adv_tax', 'total_after_gst', 'wht_type', 'wht_percentage', 'wht_amount', 'total_after_wht', 'quotation_id', 'po_id', 'account_id', 'is_dummy', 'bank_account_id', 'deleted_at'];
 
     protected static function boot()
     {
@@ -46,6 +46,21 @@ class Invoice extends Model
     {
         return $this->belongsTo(Store::class, 'store_id', 'id')->with('storeType');
     }
+
+    /**
+     * Net amount the customer must pay (cash/bank), after WHT when enabled.
+     */
+    public static function resolveTotalPayable($invoice): float
+    {
+        if ((int) ($invoice->wht_type ?? 1) === 2 && (float) ($invoice->total_after_wht ?? 0) > 0) {
+            return (float) $invoice->total_after_wht;
+        }
+        if ((float) ($invoice->total_after_adv_tax ?? 0) > 0) {
+            return (float) $invoice->total_after_adv_tax;
+        }
+        return (float) ($invoice->total_after_gst ?? 0);
+    }
+
     public function invoiceChild()
     {
         return $this->hasMany(InvoiceChild::class, 'invoice_id', 'id')->with('item');

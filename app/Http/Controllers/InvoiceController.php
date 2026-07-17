@@ -251,6 +251,10 @@ class InvoiceController extends Controller
             $invoice->total_after_gst = $request->total_after_gst;
             $invoice->adv_tax_percentage = $request->adv_tax_percentage;
             $invoice->adv_tax = $request->adv_tax;
+            $invoice->wht_type = $request->wht_type ?? 1;
+            $invoice->wht_percentage = $request->wht_percentage ?? 0;
+            $invoice->wht_amount = $request->wht_amount ?? 0;
+            $invoice->total_after_wht = $request->total_after_wht ?? 0;
             $invoice->amount_received = $request->amount_received;
             $invoice->bank_amount_received = $request->bank_amount_received;
             $invoice->date = $request->date;
@@ -260,7 +264,7 @@ class InvoiceController extends Controller
             $invoice->adv_tax_type = $request->adv_tax_type;
             $invoice->order_date = $request->order_date;
             // Set payment status
-            $totalPayable = (float) (($invoice->total_after_adv_tax > 0) ? $invoice->total_after_adv_tax : $invoice->total_after_gst);
+            $totalPayable = Invoice::resolveTotalPayable($invoice);
             $received = (float) (($invoice->amount_received ?? 0) + ($invoice->bank_amount_received ?? 0));
 
             if ($received >= $totalPayable && $totalPayable > 0) {
@@ -489,6 +493,19 @@ class InvoiceController extends Controller
                     $voucherTransaction->description = "Advance Sale Tax  " . " ,Invoice no: " . $invoice_no;
                     $voucherTransaction->save();
                     $creditside += $request->adv_tax;
+                }
+                if (($request->wht_amount ?? 0) > 0) {
+                    //------ Withholding Tax Receivable ------------
+                    $voucherTransaction = new VoucherTransaction();
+                    $voucherTransaction->voucher_id = $voucherRevGen_id;
+                    $voucherTransaction->date = Land::changeDateFormat($request->date);
+                    $voucherTransaction->coa_account_id = 3851; //Withholding Tax Receivable
+                    $voucherTransaction->is_approved = 1;
+                    $voucherTransaction->debit = $request->wht_amount;
+                    $voucherTransaction->credit = 0;
+                    $voucherTransaction->description = "Withholding Tax  " . " ,Invoice no: " . $invoice_no;
+                    $voucherTransaction->save();
+                    $debitside += $request->wht_amount;
                 }
                 ///////gst voucher
                 if ($request->gst > 0) {
@@ -755,14 +772,29 @@ class InvoiceController extends Controller
                     // $voucherTransaction->save();
                     $debitside += $request->adv_tax;
                 }
+                if (($request->wht_amount ?? 0) > 0) {
+                    //------ Withholding Tax Receivable ------------
+                    $voucherTransaction = new VoucherTransaction();
+                    $voucherTransaction->voucher_id = $voucherInvCost_id;
+                    $voucherTransaction->date = Land::changeDateFormat($request->date);
+                    $voucherTransaction->coa_account_id = 3851; //Withholding Tax Receivable
+                    $voucherTransaction->is_approved = 1;
+                    $voucherTransaction->debit = $request->wht_amount;
+                    $voucherTransaction->credit = 0;
+                    $voucherTransaction->description = "Withholding Tax " . " ,Invoice no: " . $invoice_no;
+                    $voucherTransaction->save();
+                }
                 // //---------------------Cash 1 Debit ------------------
 
+                $customerDebit = (($request->wht_amount ?? 0) > 0)
+                    ? $request->total_after_wht
+                    : $request->total_after_adv_tax;
                 $voucherTransaction = new VoucherTransaction();
                 $voucherTransaction->voucher_id = $voucherInvCost_id;
                 $voucherTransaction->date = Land::changeDateFormat($request->date);
                 $voucherTransaction->coa_account_id = $customer_account_id;
                 $voucherTransaction->is_approved = 1;
-                $voucherTransaction->debit = $request->total_after_adv_tax;
+                $voucherTransaction->debit = $customerDebit;
                 $voucherTransaction->credit = 0;
                 $voucherTransaction->description = "Goods Sold . " . '' . " ,Invoice no: " . $invoice_no;
                 $voucherTransaction->save();
@@ -814,6 +846,10 @@ class InvoiceController extends Controller
         //$invoice->is_pending = 1;
         $invoice->is_pending_neg_inventory = 1;
         $invoice->adv_tax_type = $request->adv_tax_type;
+        $invoice->wht_type = $request->wht_type ?? 1;
+        $invoice->wht_percentage = $request->wht_percentage ?? 0;
+        $invoice->wht_amount = $request->wht_amount ?? 0;
+        $invoice->total_after_wht = $request->total_after_wht ?? 0;
         $invoice->save();
         $invoice_id = $invoice->id;
         $invoice_no = 'INO-' . $invoice_id;
@@ -894,12 +930,16 @@ class InvoiceController extends Controller
                 $invoice->adv_tax_type = $request->adv_tax_type;
                 $invoice->adv_tax_percentage = $request->adv_tax_percentage;
                 $invoice->adv_tax = $request->adv_tax;
+                $invoice->wht_type = $request->wht_type ?? 1;
+                $invoice->wht_percentage = $request->wht_percentage ?? 0;
+                $invoice->wht_amount = $request->wht_amount ?? 0;
+                $invoice->total_after_wht = $request->total_after_wht ?? 0;
                 $invoice->amount_received = $request->amount_received;
                 $invoice->bank_amount_received = $request->bank_amount_received;
                 $invoice->account_id = $request->account_id;
                 $invoice->bank_account_id = $request->bank_account_id;
                 // Set payment status
-                $totalPayable = (float) (($invoice->total_after_adv_tax > 0) ? $invoice->total_after_adv_tax : $invoice->total_after_gst);
+                $totalPayable = Invoice::resolveTotalPayable($invoice);
                 $received = (float) (($invoice->amount_received ?? 0) + ($invoice->bank_amount_received ?? 0));
 
                 if ($received >= $totalPayable && $totalPayable > 0) {
@@ -1108,6 +1148,10 @@ class InvoiceController extends Controller
                 "adv_tax_percentage" => $parentData->adv_tax_percentage,
                 "total_after_adv_tax" => $parentData->total_after_adv_tax,
                 "adv_tax" => $parentData->adv_tax,
+                "wht_type" => $parentData->wht_type ?? 1,
+                "wht_percentage" => $parentData->wht_percentage ?? 0,
+                "wht_amount" => $parentData->wht_amount ?? 0,
+                "total_after_wht" => $parentData->total_after_wht ?? 0,
                 "date" => $parentData->date,
                 "order_date" => $parentData->order_date ?? '',
                 "remarks" => $parentData->remarks,
@@ -1176,6 +1220,10 @@ class InvoiceController extends Controller
             $invoice->total_after_adv_tax = $request->total_after_adv_tax;
             $invoice->adv_tax_percentage = $request->adv_tax_percentage;
             $invoice->adv_tax = $request->adv_tax ?? 0;
+            $invoice->wht_type = $request->wht_type ?? 1;
+            $invoice->wht_percentage = $request->wht_percentage ?? 0;
+            $invoice->wht_amount = $request->wht_amount ?? 0;
+            $invoice->total_after_wht = $request->total_after_wht ?? 0;
             $invoice->amount_received = $request->amount_received;
             $invoice->bank_amount_received = $request->bank_amount_received;
             $invoice->date = Land::changeDateFormat($request->date);
@@ -1186,7 +1234,7 @@ class InvoiceController extends Controller
             $invoice->adv_tax_type = $request->adv_tax_type;
             $invoice->order_date = $request->order_date;
             // Calculate total paid including existing vouchers
-            $totalPayable = (float) (($invoice->total_after_adv_tax > 0) ? $invoice->total_after_adv_tax : $invoice->total_after_gst);
+            $totalPayable = Invoice::resolveTotalPayable($invoice);
             $initialReceived = (float) (($invoice->amount_received ?? 0) + ($invoice->bank_amount_received ?? 0));
 
             $previouslyPaidViaVouchers = DB::table('voucher_transaction_invoices')
@@ -1528,6 +1576,19 @@ class InvoiceController extends Controller
                     $voucherTransaction->save();
                     $creditside += $request->adv_tax;
                 }
+                if (($request->wht_amount ?? 0) > 0) {
+                    //------ Withholding Tax Receivable ------------
+                    $voucherTransaction = new VoucherTransaction();
+                    $voucherTransaction->voucher_id = $voucherRevGen_id;
+                    $voucherTransaction->date = Land::changeDateFormat($request->date);
+                    $voucherTransaction->coa_account_id = 3851; //Withholding Tax Receivable
+                    $voucherTransaction->is_approved = 1;
+                    $voucherTransaction->debit = $request->wht_amount;
+                    $voucherTransaction->credit = 0;
+                    $voucherTransaction->description = "Withholding Tax  " . " ,Invoice no: " . $invoice_no;
+                    $voucherTransaction->save();
+                    $debitside += $request->wht_amount;
+                }
                 foreach ($request->childArray as $list) {
                     if ($list['item_discount'] > 0) {
                         $totalCashSaleVoucher += $list['item_discount'];
@@ -1797,15 +1858,30 @@ class InvoiceController extends Controller
                     // $voucherTransaction->save();
                     $debitside += $request->adv_tax;
                 }
+                if (($request->wht_amount ?? 0) > 0) {
+                    //------ Withholding Tax Receivable ------------
+                    $voucherTransaction = new VoucherTransaction();
+                    $voucherTransaction->voucher_id = $voucherInvCost_id;
+                    $voucherTransaction->date = Land::changeDateFormat($request->date);
+                    $voucherTransaction->coa_account_id = 3851; //Withholding Tax Receivable
+                    $voucherTransaction->is_approved = 1;
+                    $voucherTransaction->debit = $request->wht_amount;
+                    $voucherTransaction->credit = 0;
+                    $voucherTransaction->description = "Withholding Tax " . " ,Invoice no: " . $invoice_no;
+                    $voucherTransaction->save();
+                }
 
                 // //---------------------Cash 1 Debit ------------------
 
+                $customerDebit = (($request->wht_amount ?? 0) > 0)
+                    ? $request->total_after_wht
+                    : $request->total_after_adv_tax;
                 $voucherTransaction = new VoucherTransaction();
                 $voucherTransaction->voucher_id = $voucherInvCost_id;
                 $voucherTransaction->date = Land::changeDateFormat($request->date);
                 $voucherTransaction->coa_account_id = $customer_account_id;
                 $voucherTransaction->is_approved = 1;
-                $voucherTransaction->debit = $request->total_after_adv_tax;
+                $voucherTransaction->debit = $customerDebit;
                 $voucherTransaction->credit = 0;
                 $voucherTransaction->description = "Goods Sold . " . '' . " ,Invoice no: " . $invoice_no;
                 $voucherTransaction->save();
@@ -1880,13 +1956,17 @@ class InvoiceController extends Controller
                 $invoice->adv_tax_type = $request->adv_tax_type;
                 $invoice->adv_tax_percentage = $request->adv_tax_percentage;
                 $invoice->adv_tax = $request->adv_tax;
+                $invoice->wht_type = $request->wht_type ?? 1;
+                $invoice->wht_percentage = $request->wht_percentage ?? 0;
+                $invoice->wht_amount = $request->wht_amount ?? 0;
+                $invoice->total_after_wht = $request->total_after_wht ?? 0;
                 $invoice->amount_received = $request->amount_received;
                 $invoice->bank_amount_received = $request->bank_amount_received;
                 $invoice->account_id = $request->account_id;
                 $invoice->bank_account_id = $request->bank_account_id;
 
                 // Calculate total paid including existing vouchers
-                $totalPayable = (float) (($invoice->total_after_adv_tax > 0) ? $invoice->total_after_adv_tax : $invoice->total_after_gst);
+                $totalPayable = Invoice::resolveTotalPayable($invoice);
                 $initialReceived = (float) (($invoice->amount_received ?? 0) + ($invoice->bank_amount_received ?? 0));
 
                 $previouslyPaidViaVouchers = DB::table('voucher_transaction_invoices')

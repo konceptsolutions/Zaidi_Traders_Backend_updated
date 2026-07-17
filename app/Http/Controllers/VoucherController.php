@@ -1132,7 +1132,7 @@ class VoucherController extends Controller
                     continue;
                 }
 
-                $totalPayable = (float) ($invoice->total_after_adv_tax > 0 ? $invoice->total_after_adv_tax : $invoice->total_after_gst);
+                $totalPayable = Invoice::resolveTotalPayable($invoice);
                 $alreadyPaid = (float) (($invoice->amount_received ?? 0) + ($invoice->bank_amount_received ?? 0));
                 $due = max(0.0, $totalPayable - $alreadyPaid);
 
