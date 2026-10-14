@@ -674,6 +674,7 @@ class QuotationController extends Controller
                     $invoice->total_amount    = $request->total_amount;
                     $invoice->amount_received = $request->amount_received;
                     $invoice->bank_amount_received = $request->bank_amount_received;
+                    $invoice->total_received = (float) (($request->amount_received ?? 0) + ($request->bank_amount_received ?? 0));
                     $invoice->date        = $request->date;
                     $invoice->account_id  = $request->account_id;
                     $invoice->bank_account_id = $request->bank_account_id;

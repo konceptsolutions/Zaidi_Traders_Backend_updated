@@ -461,8 +461,7 @@ class InvoiceReturnController extends Controller
                     $stockChilddata->date = $request->date;
                     $stockChilddata->save();
 
-                    $PurchasePrice = PurchaseOrderChild::with('item')->where('item_id', $row['item_id'])->groupby('item_id')->select(DB::raw('SUM(rate*quantity) / (SUM(quantity)) as AvgPrice'), 'item_id')->first();
-                    $itemName = $PurchasePrice->item->name;
+                    $itemName = $this->resolveItemName($row['item_id'], $row['item_name'] ?? null);
 
                     $totalAvgPrice += $row['avg_price'] * $row['quantity'];
                     //   --------------Inventory credit  --------------------
@@ -520,9 +519,7 @@ class InvoiceReturnController extends Controller
                     $voucherRevenueGenid = $voucherRevenueGen->id;
                     $voucherRevGen_id = $voucherRevenueGen->id;
                     foreach ($request->childArray as $list) {
-                        $PurchasePrice = PurchaseOrderChild::with('item')->where('item_id', $list['item_id'])->groupby('item_id')->select(DB::raw('SUM(rate*quantity) / (SUM(quantity)) as AvgPrice'), 'item_id')->first();
-
-                        $itemName = $PurchasePrice->item->name;
+                        $itemName = $this->resolveItemName($list['item_id'], $list['item_name'] ?? null);
                         //---------------------Crediting Reneve ------------------
                         $voucherTransaction = new VoucherTransaction();
                         $voucherTransaction->voucher_id = $voucherRevGen_id;
@@ -627,13 +624,14 @@ class InvoiceReturnController extends Controller
 
                     $customer_account = CoaAccount::where('person_id', $request->customer_id)
                         ->where('coa_sub_group_id', 9)->first();
+                    if (!$customer_account) {
+                        throw new \Exception('Customer account not found for this customer');
+                    }
                     $customer_account_id = $customer_account->id;
 
                     foreach ($request->childArray as $list) {
                         $price += $list['rate'] * $list['quantity'];
-                        $PurchasePrice = PurchaseOrderChild::with('item')->where('item_id', $list['item_id'])->groupby('item_id')->select(DB::raw('SUM(rate*quantity) / (SUM(quantity)) as AvgPrice'), 'item_id')->first();
-
-                        $itemName = $PurchasePrice->item->name;
+                        $itemName = $this->resolveItemName($list['item_id'], $list['item_name'] ?? null);
                         //---------------------Crediting Reneve ------------------
                         $voucherTransaction = new VoucherTransaction();
                         $voucherTransaction->voucher_id = $voucherInvCost_id;
@@ -1238,5 +1236,28 @@ class InvoiceReturnController extends Controller
             $message = CustomErrorMessages::getCustomMessage($e);
             return ['status' => 'error', 'message' => $message];
         }
+    }
+
+    /**
+     * Resolve item name for voucher descriptions without requiring a purchase history.
+     */
+    private function resolveItemName($itemId, $fallbackName = null): string
+    {
+        if (!empty($fallbackName)) {
+            return (string) $fallbackName;
+        }
+
+        $item = Item::find($itemId);
+        if ($item && !empty($item->name)) {
+            return (string) $item->name;
+        }
+
+        $purchaseChild = PurchaseOrderChild::with('item')
+            ->where('item_id', $itemId)
+            ->groupby('item_id')
+            ->select(DB::raw('SUM(rate*quantity) / (SUM(quantity)) as AvgPrice'), 'item_id')
+            ->first();
+
+        return (string) ($purchaseChild->item->name ?? ('Item #' . $itemId));
     }
 }

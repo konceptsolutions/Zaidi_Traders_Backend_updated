@@ -456,9 +456,60 @@ class VoucherController extends Controller
         if ($voucher->is_auto == 1) {
             return ['status' => 'error', 'message' => "This is auto voucher you can't delete it"];
         }
-        DB::transaction(function () use ($req) {
-            Voucher::where('id', $req->voucher_id)->delete();
-            VoucherTransaction::where('voucher_id', $req->voucher_id)->delete();
+
+        DB::transaction(function () use ($req, $voucher) {
+            $voucherId = $req->voucher_id;
+
+            // Invoices linked via pivot + direct voucher.invoice_id
+            $linkedInvoiceIds = VoucherTransactionInvoice::where('voucher_id', $voucherId)
+                ->pluck('invoice_id')
+                ->toArray();
+
+            if (!empty($voucher->invoice_id)) {
+                $linkedInvoiceIds[] = $voucher->invoice_id;
+            }
+            $linkedInvoiceIds = array_values(array_unique(array_filter($linkedInvoiceIds)));
+
+            Voucher::where('id', $voucherId)->delete();
+            VoucherTransaction::where('voucher_id', $voucherId)->delete();
+            VoucherTransactionInvoice::where('voucher_id', $voucherId)->delete();
+
+            foreach ($linkedInvoiceIds as $invoiceId) {
+                $invoice = Invoice::find($invoiceId);
+                if (!$invoice) {
+                    continue;
+                }
+
+                // Hold invoices stay unpaid
+                if ((int) $invoice->is_dummy === 1) {
+                    $invoice->payment_status = 'unpaid';
+                    $invoice->save();
+                    continue;
+                }
+
+                $cashBankReceived = (float) (($invoice->amount_received ?? 0) + ($invoice->bank_amount_received ?? 0));
+
+                $remainingVoucherPayments = (float) DB::table('voucher_transaction_invoices')
+                    ->join('vouchers', 'voucher_transaction_invoices.voucher_id', '=', 'vouchers.id')
+                    ->where('voucher_transaction_invoices.invoice_id', $invoiceId)
+                    ->whereNull('voucher_transaction_invoices.deleted_at')
+                    ->whereNull('vouchers.deleted_at')
+                    ->sum('vouchers.total_amount');
+
+                $totalReceived = $cashBankReceived + $remainingVoucherPayments;
+                $invoice->total_received = $totalReceived;
+
+                $totalPayable = Invoice::resolveTotalPayable($invoice);
+                if ($totalReceived >= $totalPayable && $totalPayable > 0) {
+                    $invoice->payment_status = 'paid';
+                } elseif ($totalReceived > 0) {
+                    $invoice->payment_status = 'partial_paid';
+                } else {
+                    $invoice->payment_status = 'unpaid';
+                }
+
+                $invoice->save();
+            }
         });
 
         return ['status' => 'ok', 'message' => 'Voucher deleted successfully'];
@@ -1079,6 +1130,9 @@ class VoucherController extends Controller
             $userId = 1;
 
             $invoiceNumbersString = implode(', ', $invoiceNumbers);
+            $invoiceIds = $req->invoice_id;
+            $primaryInvoiceId = count($invoiceIds) === 1 ? $invoiceIds[0] : null;
+
             $voucher = new Voucher();
 
             $voucher->voucher_no = $newVoucherNo;
@@ -1087,6 +1141,7 @@ class VoucherController extends Controller
             $voucher->name = $voucherName . $customer_name . " Invoice Nos: " . $invoiceNumbersString;
             $voucher->type = $voucherType;
             $voucher->total_amount = $req->amount;
+            $voucher->invoice_id = $primaryInvoiceId;
             $voucher->cheque_no = $req->cheque_no;
             $voucher->cheque_date = Land::changeDateFormat($req->cheque_date);
             $voucher->is_post_dated = $is_post_dated;
@@ -1103,7 +1158,7 @@ class VoucherController extends Controller
             $voucherTransaction->coa_account_id = $req->account_id;
             $voucherTransaction->debit = $req->amount;
             $voucherTransaction->credit = 0;
-            // $voucherTransaction->invoice_id = implode(', ', $req->invoice_id); // Corrected this line
+            $voucherTransaction->invoice_id = $primaryInvoiceId;
             $voucherTransaction->is_approved = 1;
             $voucherTransaction->description = $voucherName . $customer_name . " Invoice Nos: " . $invoiceNumbersString;
             $voucherTransaction->save();
@@ -1116,13 +1171,12 @@ class VoucherController extends Controller
             $voucherTransaction2->debit = 0;
             $voucherTransaction2->is_approved = 1;
             $voucherTransaction2->credit = $req->amount;
-            // $voucherTransaction2->invoice_id = implode(', ', $req->invoice_id); // Corrected this line
+            $voucherTransaction2->invoice_id = $primaryInvoiceId;
             $voucherTransaction2->description = $voucherName . $customer_name . " Invoice Nos: " . $invoiceNumbersString;
             $voucherTransaction2->save();
 
 
             $remainingAmount = (float) $req->amount;
-            $invoiceIds = $req->invoice_id;
             $lastInvoiceId = end($invoiceIds);
 
             foreach ($invoiceIds as $invoice_id) {
@@ -1133,7 +1187,22 @@ class VoucherController extends Controller
                 }
 
                 $totalPayable = Invoice::resolveTotalPayable($invoice);
-                $alreadyPaid = (float) (($invoice->amount_received ?? 0) + ($invoice->bank_amount_received ?? 0));
+
+                // Baseline from invoice cash/bank received
+                $initialReceived = (float) (($invoice->amount_received ?? 0) + ($invoice->bank_amount_received ?? 0));
+
+                // Previous voucher payments linked to this invoice
+                $previouslyPaidViaVouchers = (float) DB::table('voucher_transaction_invoices')
+                    ->join('vouchers', 'voucher_transaction_invoices.voucher_id', '=', 'vouchers.id')
+                    ->where('voucher_transaction_invoices.invoice_id', $invoice_id)
+                    ->where('vouchers.deleted_at', null)
+                    ->sum('vouchers.total_amount');
+
+                // Prefer stored total_received; fall back for legacy rows not yet incremented by vouchers
+                $alreadyPaid = max(
+                    (float) ($invoice->total_received ?? 0),
+                    $initialReceived + $previouslyPaidViaVouchers
+                );
                 $due = max(0.0, $totalPayable - $alreadyPaid);
 
                 // Determine how much of the current voucher applies to this invoice
@@ -1143,15 +1212,9 @@ class VoucherController extends Controller
                     $remainingAmount -= $currentVoucherPayment;
                 }
 
-                // Calculate all PREVIOUS payments made via vouchers for this invoice
-                $previouslyPaidViaVouchers = DB::table('voucher_transaction_invoices')
-                    ->join('vouchers', 'voucher_transaction_invoices.voucher_id', '=', 'vouchers.id')
-                    ->where('voucher_transaction_invoices.invoice_id', $invoice_id)
-                    ->where('vouchers.deleted_at', null)
-                    ->sum('vouchers.total_amount');
-
-                // Total = Current Voucher + Previous Vouchers + Initial Received Amounts
-                $totalPaidWithVoucher = $alreadyPaid + $previouslyPaidViaVouchers + $currentVoucherPayment;
+                // Increment total_received by this voucher's share
+                $totalPaidWithVoucher = $alreadyPaid + $currentVoucherPayment;
+                $invoice->total_received = $totalPaidWithVoucher;
 
                 $oldStatus = $invoice->payment_status;
                 if ($totalPaidWithVoucher >= $totalPayable && $totalPayable > 0) {
@@ -1169,6 +1232,7 @@ class VoucherController extends Controller
                     'previouslyPaidVouchers' => $previouslyPaidViaVouchers,
                     'currentVoucher' => $currentVoucherPayment,
                     'totalPaidSum' => $totalPaidWithVoucher,
+                    'total_received' => $invoice->total_received,
                     'oldStatus' => $oldStatus,
                     'newStatus' => $invoice->payment_status
                 ]);

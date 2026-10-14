@@ -1197,6 +1197,13 @@ Route::get('editSale', [InvoiceController::class, 'edit']);
 Route::post('updateSale', [InvoiceController::class, 'update']);
 
 /**
+ * Mark invoice as paid.
+ * @param  \Illuminate\Http\Request  $invoice_id
+ * @return \Illuminate\Http\Response
+ */
+Route::post('markInvoiceAsPaid', [InvoiceController::class, 'markInvoiceAsPaid']);
+
+/**
  * Delete a sale.
  * @param \Illuminate\Http\Response id
  * @return \Illuminate\Http\Response
