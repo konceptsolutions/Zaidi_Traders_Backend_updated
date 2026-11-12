@@ -489,12 +489,7 @@ class VoucherController extends Controller
 
                 $cashBankReceived = (float) (($invoice->amount_received ?? 0) + ($invoice->bank_amount_received ?? 0));
 
-                $remainingVoucherPayments = (float) DB::table('voucher_transaction_invoices')
-                    ->join('vouchers', 'voucher_transaction_invoices.voucher_id', '=', 'vouchers.id')
-                    ->where('voucher_transaction_invoices.invoice_id', $invoiceId)
-                    ->whereNull('voucher_transaction_invoices.deleted_at')
-                    ->whereNull('vouchers.deleted_at')
-                    ->sum('vouchers.total_amount');
+                $remainingVoucherPayments = VoucherTransactionInvoice::paidAmountForInvoice($invoiceId);
 
                 $totalReceived = $cashBankReceived + $remainingVoucherPayments;
                 $invoice->total_received = $totalReceived;
@@ -1083,7 +1078,7 @@ class VoucherController extends Controller
         Log::info("invoicePaymentVoucher called", $req->all());
         $rules = array(
             'customer_id' => 'required',
-            'amount' => 'required|numeric',
+            'amount' => 'required|numeric|gt:0',
             'invoice_id' => 'required',
             'date' => 'required',
             'account_id' => 'required|numeric'
@@ -1092,161 +1087,286 @@ class VoucherController extends Controller
         if ($validator->fails()) {
             return ['status' => 'error', 'message' => $validator->errors()->first()];
         }
-        
-        // Normalize invoice_id to always be an array
-        if (!is_array($req->invoice_id)) {
-            $req->merge(['invoice_id' => [$req->invoice_id]]);
+
+        $invoiceIds = $this->normalizeInvoiceIds($req->invoice_id);
+        if (count($invoiceIds) === 0) {
+            return ['status' => 'error', 'message' => 'Select at least one invoice'];
         }
-        
+
+        $invoices = Invoice::whereIn('id', $invoiceIds)->get()->keyBy('id');
+        $orderedInvoices = [];
+        foreach ($invoiceIds as $invoiceId) {
+            $invoice = $invoices->get($invoiceId);
+            if (!$invoice) {
+                return ['status' => 'error', 'message' => 'Invoice not found: ' . $invoiceId];
+            }
+            if ((int) $invoice->customer_id !== (int) $req->customer_id) {
+                return ['status' => 'error', 'message' => 'Invoice ' . $invoice->invoice_no . ' does not belong to this customer'];
+            }
+            $orderedInvoices[] = $invoice;
+        }
+
+        $explicitAmounts = $this->explicitInvoiceAmounts($req);
+        if ($explicitAmounts !== null) {
+            $amountCheck = $this->validateExplicitInvoiceAmounts($explicitAmounts, $invoiceIds, (float) $req->amount);
+            if ($amountCheck !== null) {
+                return $amountCheck;
+            }
+        }
+
+        $customer = Person::find($req->customer_id);
+        if (!$customer) {
+            return ['status' => 'error', 'message' => 'Customer not found'];
+        }
+        $customer_coa_account_id = CoaAccount::where([['coa_sub_group_id', 9], ['person_id', $req->customer_id]])->value('id');
+        if (!$customer_coa_account_id) {
+            return ['status' => 'error', 'message' => 'Customer account not found'];
+        }
+
         // To get the date Financial Year Closed
         $getFinYearClosing = DB::table('fin_year_closing')->select('to_date')->orderBy('to_date', 'desc')->first();
 
         // Compare request date and date of Financial Year Closed
-        if (Land::changeDateFormat($req->date) <= $getFinYearClosing->to_date) {
+        if ($getFinYearClosing && Land::changeDateFormat($req->date) <= $getFinYearClosing->to_date) {
             return ['status' => 'error', 'message' => "Financial Year Closed." . '' . '(' . $getFinYearClosing->to_date . ')'];
         }
-        DB::transaction(function () use ($req) {
-            $customer = Person::find($req->customer_id);
-            $customer_coa_account_id = CoaAccount::where([['coa_sub_group_id', 9], ['person_id', $req->customer_id]])->value('id');
-            $customer_name = $customer->name;
 
-            $invoiceNumbers = [];
-            foreach ($req->invoice_id as $invoice_id) {
-                $invoice = Invoice::find($invoice_id);
-                $invoiceNumbers[] = $invoice->invoice_no;
-            }
-            //------------------Payment or receipt Voucher-----------
-            $date = Land::changeDateFormat($req->date);
-
-            $is_post_dated = isset($req->cheque_no) ? 1 : 0;
-            $voucherType = 2;
-
-            $voucherName = '';
-
-            $getVoucherNo = DB::table('vouchers')->where('type', $voucherType)->orderBy('id', 'desc')->first();
-            $newVoucherNo = $getVoucherNo ? $getVoucherNo->voucher_no + 1 : 1;
-            $user = Auth::guard('api')->user();
-            // $userId = $user->id;
-            $userId = 1;
-
-            $invoiceNumbersString = implode(', ', $invoiceNumbers);
-            $invoiceIds = $req->invoice_id;
-            $primaryInvoiceId = count($invoiceIds) === 1 ? $invoiceIds[0] : null;
-
-            $voucher = new Voucher();
-
-            $voucher->voucher_no = $newVoucherNo;
-            $voucher->date = $date;
-            $voucher->generated_at = $date;
-            $voucher->name = $voucherName . $customer_name . " Invoice Nos: " . $invoiceNumbersString;
-            $voucher->type = $voucherType;
-            $voucher->total_amount = $req->amount;
-            $voucher->invoice_id = $primaryInvoiceId;
-            $voucher->cheque_no = $req->cheque_no;
-            $voucher->cheque_date = Land::changeDateFormat($req->cheque_date);
-            $voucher->is_post_dated = $is_post_dated;
-            $voucher->created_by = $userId;
-            $voucher->isApproved = 1;
-            $voucher->save();
-            $voucher_id = $voucher->id;
-
-            //--------------debiting cash account --------------------
-
-            $voucherTransaction = new VoucherTransaction();
-            $voucherTransaction->voucher_id = $voucher_id;
-            $voucherTransaction->date = $date;
-            $voucherTransaction->coa_account_id = $req->account_id;
-            $voucherTransaction->debit = $req->amount;
-            $voucherTransaction->credit = 0;
-            $voucherTransaction->invoice_id = $primaryInvoiceId;
-            $voucherTransaction->is_approved = 1;
-            $voucherTransaction->description = $voucherName . $customer_name . " Invoice Nos: " . $invoiceNumbersString;
-            $voucherTransaction->save();
-
-            //---------------------Crediting investor account ------------------
-            $voucherTransaction2 = new VoucherTransaction();
-            $voucherTransaction2->voucher_id = $voucher_id;
-            $voucherTransaction2->date = $date;
-            $voucherTransaction2->coa_account_id = $customer_coa_account_id;
-            $voucherTransaction2->debit = 0;
-            $voucherTransaction2->is_approved = 1;
-            $voucherTransaction2->credit = $req->amount;
-            $voucherTransaction2->invoice_id = $primaryInvoiceId;
-            $voucherTransaction2->description = $voucherName . $customer_name . " Invoice Nos: " . $invoiceNumbersString;
-            $voucherTransaction2->save();
-
-
-            $remainingAmount = (float) $req->amount;
-            $lastInvoiceId = end($invoiceIds);
-
-            foreach ($invoiceIds as $invoice_id) {
-                $invoice = Invoice::find($invoice_id);
-                if (!$invoice) {
-                    Log::warning("Invoice not found during payment voucher creation", ['invoice_id' => $invoice_id]);
-                    continue;
+        try {
+            $result = DB::transaction(function () use ($req, $orderedInvoices, $customer, $customer_coa_account_id, $explicitAmounts) {
+                $customer_name = $customer->name;
+                $invoiceNumbers = [];
+                foreach ($orderedInvoices as $invoice) {
+                    $invoiceNumbers[] = $invoice->invoice_no;
                 }
 
-                $totalPayable = Invoice::resolveTotalPayable($invoice);
+                $date = Land::changeDateFormat($req->date);
+                $is_post_dated = isset($req->cheque_no) && $req->cheque_no !== '' ? 1 : 0;
+                $voucherType = 2;
+                $voucherName = '';
 
-                // Baseline from invoice cash/bank received
-                $initialReceived = (float) (($invoice->amount_received ?? 0) + ($invoice->bank_amount_received ?? 0));
+                $getVoucherNo = DB::table('vouchers')->where('type', $voucherType)->orderBy('id', 'desc')->first();
+                $newVoucherNo = $getVoucherNo ? $getVoucherNo->voucher_no + 1 : 1;
+                $userId = 1;
 
-                // Previous voucher payments linked to this invoice
-                $previouslyPaidViaVouchers = (float) DB::table('voucher_transaction_invoices')
-                    ->join('vouchers', 'voucher_transaction_invoices.voucher_id', '=', 'vouchers.id')
-                    ->where('voucher_transaction_invoices.invoice_id', $invoice_id)
-                    ->where('vouchers.deleted_at', null)
-                    ->sum('vouchers.total_amount');
+                $invoiceNumbersString = implode(', ', $invoiceNumbers);
+                $primaryInvoiceId = count($orderedInvoices) === 1 ? $orderedInvoices[0]->id : null;
 
-                // Prefer stored total_received; fall back for legacy rows not yet incremented by vouchers
-                $alreadyPaid = max(
-                    (float) ($invoice->total_received ?? 0),
-                    $initialReceived + $previouslyPaidViaVouchers
-                );
-                $due = max(0.0, $totalPayable - $alreadyPaid);
+                $voucher = new Voucher();
+                $voucher->voucher_no = $newVoucherNo;
+                $voucher->date = $date;
+                $voucher->generated_at = $date;
+                $voucher->name = $voucherName . $customer_name . " Invoice Nos: " . $invoiceNumbersString;
+                $voucher->type = $voucherType;
+                $voucher->total_amount = $req->amount;
+                $voucher->invoice_id = $primaryInvoiceId;
+                $voucher->cheque_no = $req->cheque_no;
+                $voucher->cheque_date = $req->cheque_date ? Land::changeDateFormat($req->cheque_date) : null;
+                $voucher->is_post_dated = $is_post_dated;
+                $voucher->created_by = $userId;
+                $voucher->isApproved = 1;
+                $voucher->save();
+                $voucher_id = $voucher->id;
 
-                // Determine how much of the current voucher applies to this invoice
-                $currentVoucherPayment = 0.0;
-                if ($remainingAmount > 0) {
-                    $currentVoucherPayment = ($invoice_id == $lastInvoiceId) ? $remainingAmount : min($remainingAmount, $due);
-                    $remainingAmount -= $currentVoucherPayment;
+                $description = $voucherName . $customer_name . " Invoice Nos: " . $invoiceNumbersString;
+
+                // Debit the cash or bank account for the full receipt.
+                $voucherTransaction = new VoucherTransaction();
+                $voucherTransaction->voucher_id = $voucher_id;
+                $voucherTransaction->date = $date;
+                $voucherTransaction->coa_account_id = $req->account_id;
+                $voucherTransaction->debit = $req->amount;
+                $voucherTransaction->credit = 0;
+                $voucherTransaction->invoice_id = $primaryInvoiceId;
+                $voucherTransaction->is_approved = 1;
+                $voucherTransaction->description = $description;
+                $voucherTransaction->save();
+
+                // Credit the customer once for the full receipt.
+                $voucherTransaction2 = new VoucherTransaction();
+                $voucherTransaction2->voucher_id = $voucher_id;
+                $voucherTransaction2->date = $date;
+                $voucherTransaction2->coa_account_id = $customer_coa_account_id;
+                $voucherTransaction2->debit = 0;
+                $voucherTransaction2->is_approved = 1;
+                $voucherTransaction2->credit = $req->amount;
+                $voucherTransaction2->invoice_id = $primaryInvoiceId;
+                $voucherTransaction2->description = $description;
+                $voucherTransaction2->save();
+
+                $allocations = $this->allocateReceiptAmount($orderedInvoices, (float) $req->amount, $explicitAmounts);
+                $allocationResult = [];
+
+                foreach ($allocations as $allocation) {
+                    $invoice = $allocation['invoice'];
+                    $applied = (float) $allocation['amount'];
+                    if ($applied <= 0) {
+                        continue;
+                    }
+
+                    $totalPayable = Invoice::resolveTotalPayable($invoice);
+                    $alreadyPaid = $this->amountAlreadyReceived($invoice);
+                    $totalPaidWithVoucher = $alreadyPaid + $applied;
+                    $invoice->total_received = $totalPaidWithVoucher;
+
+                    if ($totalPaidWithVoucher >= $totalPayable && $totalPayable > 0) {
+                        $invoice->payment_status = 'paid';
+                    } elseif ($totalPaidWithVoucher > 0) {
+                        $invoice->payment_status = 'partial_paid';
+                    } else {
+                        $invoice->payment_status = 'unpaid';
+                    }
+                    $invoice->save();
+
+                    VoucherTransactionInvoice::create([
+                        'voucher_id' => $voucher_id,
+                        'invoice_id' => $invoice->id,
+                        'amount' => $applied,
+                    ]);
+
+                    $allocationResult[] = [
+                        'invoice_id' => $invoice->id,
+                        'invoice_no' => $invoice->invoice_no,
+                        'amount' => $applied,
+                        'total_received' => $invoice->total_received,
+                        'payment_status' => $invoice->payment_status,
+                    ];
                 }
 
-                // Increment total_received by this voucher's share
-                $totalPaidWithVoucher = $alreadyPaid + $currentVoucherPayment;
-                $invoice->total_received = $totalPaidWithVoucher;
-
-                $oldStatus = $invoice->payment_status;
-                if ($totalPaidWithVoucher >= $totalPayable && $totalPayable > 0) {
-                    $invoice->payment_status = 'paid';
-                } elseif ($totalPaidWithVoucher > 0) {
-                    $invoice->payment_status = 'partial_paid';
-                } else {
-                    $invoice->payment_status = 'unpaid';
-                }
-
-                Log::info("Payment Status Update Log", [
-                    'invoice_id' => $invoice_id,
-                    'totalPayable' => $totalPayable,
-                    'alreadyPaid' => $alreadyPaid,
-                    'previouslyPaidVouchers' => $previouslyPaidViaVouchers,
-                    'currentVoucher' => $currentVoucherPayment,
-                    'totalPaidSum' => $totalPaidWithVoucher,
-                    'total_received' => $invoice->total_received,
-                    'oldStatus' => $oldStatus,
-                    'newStatus' => $invoice->payment_status
-                ]);
-
-                $invoice->save();
-
-                VoucherTransactionInvoice::create([
+                return [
                     'voucher_id' => $voucher_id,
-                    'invoice_id' => $invoice_id,
-                ]);
-            }
-        });
+                    'allocations' => $allocationResult,
+                ];
+            });
+        } catch (\Exception $e) {
+            return ['status' => 'error', 'message' => $e->getMessage()];
+        }
 
-        return ["status" => "ok", "message" => "Payment Received successfully"];
+        return [
+            'status' => 'ok',
+            'message' => 'Payment Received successfully',
+            'voucher_id' => $result['voucher_id'],
+            'allocations' => $result['allocations'],
+        ];
+    }
+
+    /**
+     * Accept a single id, a list of ids, or a comma-separated string.
+     */
+    private function normalizeInvoiceIds($invoiceId): array
+    {
+        if (is_string($invoiceId) && strpos($invoiceId, ',') !== false) {
+            $invoiceId = array_map('trim', explode(',', $invoiceId));
+        }
+        if (!is_array($invoiceId)) {
+            $invoiceId = [$invoiceId];
+        }
+
+        $ids = [];
+        foreach ($invoiceId as $value) {
+            if (is_array($value)) {
+                $value = $value['invoice_id'] ?? $value['id'] ?? null;
+            }
+            if ($value === null || $value === '') {
+                continue;
+            }
+            $id = (int) $value;
+            if ($id > 0 && !in_array($id, $ids, true)) {
+                $ids[] = $id;
+            }
+        }
+
+        return $ids;
+    }
+
+    /**
+     * Optional per-invoice amounts. When omitted, the receipt is applied
+     * to the invoices in the order sent.
+     */
+    private function explicitInvoiceAmounts(Request $req): ?array
+    {
+        $rows = $req->input('invoices');
+        if (!is_array($rows) || count($rows) === 0) {
+            if (is_array($req->invoice_id) && isset($req->invoice_id[0]) && is_array($req->invoice_id[0]) && array_key_exists('amount', $req->invoice_id[0])) {
+                $rows = $req->invoice_id;
+            } else {
+                return null;
+            }
+        }
+
+        $amounts = [];
+        foreach ($rows as $row) {
+            if (!is_array($row)) {
+                continue;
+            }
+            $id = (int) ($row['invoice_id'] ?? $row['id'] ?? 0);
+            if ($id <= 0 || !isset($row['amount']) || !is_numeric($row['amount'])) {
+                continue;
+            }
+            $amounts[$id] = (float) $row['amount'];
+        }
+
+        return count($amounts) > 0 ? $amounts : null;
+    }
+
+    private function validateExplicitInvoiceAmounts(array $amounts, array $invoiceIds, float $totalAmount)
+    {
+        foreach ($invoiceIds as $invoiceId) {
+            if (!array_key_exists($invoiceId, $amounts)) {
+                return ['status' => 'error', 'message' => 'Amount is missing for invoice ' . $invoiceId];
+            }
+            if ($amounts[$invoiceId] < 0) {
+                return ['status' => 'error', 'message' => 'Invoice amount cannot be negative'];
+            }
+        }
+
+        $sum = 0.0;
+        foreach ($invoiceIds as $invoiceId) {
+            $sum += $amounts[$invoiceId];
+        }
+        if (abs($sum - $totalAmount) > 0.05) {
+            return ['status' => 'error', 'message' => 'Invoice amounts must add up to the receipt amount'];
+        }
+
+        return null;
+    }
+
+    private function amountAlreadyReceived(Invoice $invoice): float
+    {
+        $initialReceived = (float) (($invoice->amount_received ?? 0) + ($invoice->bank_amount_received ?? 0));
+        $previouslyPaidViaVouchers = VoucherTransactionInvoice::paidAmountForInvoice($invoice->id);
+
+        return max((float) ($invoice->total_received ?? 0), $initialReceived + $previouslyPaidViaVouchers);
+    }
+
+    /**
+     * Split one receipt across the selected invoices.
+     * Without explicit amounts, each invoice is filled up to what it still owes.
+     * Anything left is applied to the last invoice.
+     */
+    private function allocateReceiptAmount(array $invoices, float $amount, ?array $explicitAmounts): array
+    {
+        $allocations = [];
+        $remaining = $amount;
+        $lastIndex = count($invoices) - 1;
+
+        foreach ($invoices as $index => $invoice) {
+            if ($explicitAmounts !== null) {
+                $applied = (float) ($explicitAmounts[$invoice->id] ?? 0);
+            } elseif ($index === $lastIndex) {
+                $applied = $remaining;
+            } else {
+                $due = max(0.0, Invoice::resolveTotalPayable($invoice) - $this->amountAlreadyReceived($invoice));
+                $applied = min($remaining, $due);
+            }
+
+            $remaining -= $applied;
+            $allocations[] = [
+                'invoice' => $invoice,
+                'amount' => $applied,
+            ];
+        }
+
+        return $allocations;
     }
 
 

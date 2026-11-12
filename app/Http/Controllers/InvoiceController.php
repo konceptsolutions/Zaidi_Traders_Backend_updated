@@ -1194,6 +1194,8 @@ class InvoiceController extends Controller
             $totalCashSaleVoucher = 0;
             $invoice = Invoice::find($request->id);
             $oldCustomerId = $invoice->customer_id;
+            $previousPaymentStatus = $invoice->payment_status;
+            $previousTotalReceived = $invoice->total_received;
             $invoice->sale_type = $request->sale_type;
             $invoice->pono = $request->po_no;
             $invoice->tax_type = $request->tax_type;
@@ -1236,35 +1238,15 @@ class InvoiceController extends Controller
 
             $totalPayable = Invoice::resolveTotalPayable($invoice);
 
-            // On customer change: status from cash + bank received only (ignore old vouchers)
+            // Customer change keeps the existing paid status and amount already received.
             if ($customerChanged) {
-                $cashNull = is_null($request->amount_received) || $request->amount_received === '';
-                $bankNull = is_null($request->bank_amount_received) || $request->bank_amount_received === '';
-
-                if ($cashNull && $bankNull) {
-                    $invoice->payment_status = 'unpaid';
-                    $invoice->total_received = 0;
-                } else {
-                    $received = (float) (($request->amount_received ?? 0) + ($request->bank_amount_received ?? 0));
-                    $invoice->total_received = $received;
-
-                    if ($received >= $totalPayable && $totalPayable > 0) {
-                        $invoice->payment_status = 'paid';
-                    } elseif ($received > 0) {
-                        $invoice->payment_status = 'partial_paid';
-                    } else {
-                        $invoice->payment_status = 'unpaid';
-                    }
-                }
+                $invoice->payment_status = $previousPaymentStatus;
+                $invoice->total_received = $previousTotalReceived;
             } else {
                 // Calculate total paid including existing vouchers
                 $initialReceived = (float) ($invoice->total_received ?? 0);
 
-                $previouslyPaidViaVouchers = DB::table('voucher_transaction_invoices')
-                    ->join('vouchers', 'voucher_transaction_invoices.voucher_id', '=', 'vouchers.id')
-                    ->where('voucher_transaction_invoices.invoice_id', $invoice->id)
-                    ->where('vouchers.deleted_at', null)
-                    ->sum('vouchers.total_amount');
+                $previouslyPaidViaVouchers = VoucherTransactionInvoice::paidAmountForInvoice($invoice->id);
 
                 $totalPaidSum = $initialReceived + $previouslyPaidViaVouchers;
                 $invoice->total_received = $totalPaidSum;
@@ -1282,67 +1264,8 @@ class InvoiceController extends Controller
             $invoice_id = $invoice->id;
             $invoiceChilddata = InvoiceChild::where('invoice_id', $request->id)->get();
 
-            // A receipt posted through Other Voucher stays, unless the customer changed.
-            if ($customerChanged) {
-                $receiptVoucherIds = Voucher::where('is_auto', 0)
-                    ->where('type', 2)
-                    ->where(function ($query) use ($request) {
-                        $query->where('invoice_id', $request->id)
-                            ->orWhereIn('id', function ($sub) use ($request) {
-                                $sub->select('voucher_id')
-                                    ->from('voucher_transaction_invoices')
-                                    ->where('invoice_id', $request->id)
-                                    ->whereNull('deleted_at');
-                            });
-                    })
-                    ->pluck('id');
-
-                foreach ($receiptVoucherIds as $receiptVoucherId) {
-                    $linkedInvoiceIds = VoucherTransactionInvoice::where('voucher_id', $receiptVoucherId)
-                        ->pluck('invoice_id')
-                        ->all();
-                    $directInvoiceId = Voucher::where('id', $receiptVoucherId)->value('invoice_id');
-                    if (!empty($directInvoiceId)) {
-                        $linkedInvoiceIds[] = $directInvoiceId;
-                    }
-
-                    Voucher::where('id', $receiptVoucherId)->delete();
-                    VoucherTransaction::where('voucher_id', $receiptVoucherId)->delete();
-                    VoucherTransactionInvoice::where('voucher_id', $receiptVoucherId)->delete();
-
-                    foreach (array_unique(array_filter($linkedInvoiceIds)) as $linkedInvoiceId) {
-                        if ((int) $linkedInvoiceId === (int) $request->id) {
-                            continue;
-                        }
-                        $linkedInvoice = Invoice::find($linkedInvoiceId);
-                        if (!$linkedInvoice || (int) $linkedInvoice->is_dummy === 1) {
-                            continue;
-                        }
-
-                        $cashBankReceived = (float) (($linkedInvoice->amount_received ?? 0) + ($linkedInvoice->bank_amount_received ?? 0));
-                        $remainingVoucherPayments = (float) DB::table('voucher_transaction_invoices')
-                            ->join('vouchers', 'voucher_transaction_invoices.voucher_id', '=', 'vouchers.id')
-                            ->where('voucher_transaction_invoices.invoice_id', $linkedInvoiceId)
-                            ->whereNull('voucher_transaction_invoices.deleted_at')
-                            ->whereNull('vouchers.deleted_at')
-                            ->sum('vouchers.total_amount');
-
-                        $totalReceived = $cashBankReceived + $remainingVoucherPayments;
-                        $linkedInvoice->total_received = $totalReceived;
-                        $linkedPayable = Invoice::resolveTotalPayable($linkedInvoice);
-                        if ($totalReceived >= $linkedPayable && $linkedPayable > 0) {
-                            $linkedInvoice->payment_status = 'paid';
-                        } elseif ($totalReceived > 0) {
-                            $linkedInvoice->payment_status = 'partial_paid';
-                        } else {
-                            $linkedInvoice->payment_status = 'unpaid';
-                        }
-                        $linkedInvoice->save();
-                    }
-                }
-            }
-
-            // Rebuild only the vouchers this invoice generated.
+            // Rebuild only the vouchers this invoice generated. A receipt posted
+            // through Other Voucher is left in place, including when the customer changes.
             $autoVouchers = Voucher::where('invoice_id', $request->id)
                 ->where('is_auto', 1)
                 ->select('id')
