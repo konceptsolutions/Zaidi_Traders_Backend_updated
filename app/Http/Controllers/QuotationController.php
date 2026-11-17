@@ -43,6 +43,7 @@ class QuotationController extends Controller
             $customer_id = $req->customer_id;
             $sales_rep_id = $req->sales_rep_id;
             $quotation_no = $req->quotation_no;
+            $item_id = $req->item_id;
             $from = $req->from_date;
             $to = $req->to_date;
             // $searcField = $req->searcField;
@@ -62,6 +63,11 @@ class QuotationController extends Controller
                 })
                 ->when($to, function ($q, $to) {
                     return $q->where('date', '<=', $to);
+                })
+                ->when($item_id, function ($query, $item_id) {
+                    $query->whereHas('quotationchild', function ($qu) use ($item_id) {
+                        $qu->where('item_id', $item_id);
+                    });
                 })
                 // ->when($searcField, function ($q, $searcField) {
                 //     return $q->where('remarks',  'LIKE', '%' . $searcField . '%');

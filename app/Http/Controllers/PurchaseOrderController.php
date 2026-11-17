@@ -73,6 +73,7 @@ class PurchaseOrderController extends Controller
             $po_no = $req->po_no;
             $store_id = $req->store_id;
             $store_type_id = $req->store_type_id;
+            $item_id = $req->item_id;
             $received_from = $req->receive_from;
             $received_to = $req->receive_to;
             $from = $req->from_date;
@@ -109,6 +110,11 @@ class PurchaseOrderController extends Controller
                 })
                 ->when($received_to, function ($q, $received_to) {
                     return $q->where('receive_date', '<=', $received_to);
+                })
+                ->when($item_id, function ($query, $item_id) {
+                    $query->whereHas('purchaseorderchild', function ($qu) use ($item_id) {
+                        $qu->where('item_id', $item_id);
+                    });
                 })
                 ->when($searcField, function ($q, $searcField) {
                     return $q->where('remarks', 'LIKE', '%' . $searcField . '%');
@@ -575,15 +581,21 @@ class PurchaseOrderController extends Controller
             $purchaseorder->total_after_discount = $request->total_after_discount;
             $purchaseorder->save();
 
-            // Capture old PO totals per item (before we update/delete) for avg cost re-receive formula
+            // Capture old PO totals per item (before we update/delete) for avg cost re-receive formula.
+            // Only count lines that were actually received before — PO create often fills rate/total
+            // while received_quantity is still 0; subtracting that total on first receive dilutes avg.
             $oldPOByItem = ['quantity' => [], 'total' => []];
             foreach (PurchaseOrderChild::where('purchase_order_id', $request->id)->get() as $oldChild) {
                 $id = $oldChild->item_id;
+                $prevReceivedQty = (float) $oldChild->received_quantity;
+                if ($prevReceivedQty <= 0) {
+                    continue;
+                }
                 if (!isset($oldPOByItem['quantity'][$id])) {
                     $oldPOByItem['quantity'][$id] = 0;
                     $oldPOByItem['total'][$id] = 0;
                 }
-                $oldPOByItem['quantity'][$id] += (float) $oldChild->received_quantity;
+                $oldPOByItem['quantity'][$id] += $prevReceivedQty;
                 $oldPOByItem['total'][$id] += (float) $oldChild->total;
             }
 
@@ -628,8 +640,15 @@ class PurchaseOrderController extends Controller
                     $purchaseChilddata->batch_no = $batchNo;
                     $purchaseChilddata->pack = $row['pack'] ?? 1;
                     $purchaseChilddata->expiry_date = $expiryDate;
-                    $purchaseChilddata->rate = $row['purchase_price'] ?? 0;
-                    $purchaseChilddata->total = $row['amount'] ?? ($row['received_quantity'] * ($row['purchase_price'] ?? 0));
+                    $purchasePrice = (float) ($row['purchase_price'] ?? 0);
+                    $receivedQtyRow = (float) ($row['received_quantity'] ?? 0);
+                    $lineTotal = (float) ($row['amount'] ?? 0);
+                    // If amount missing/zero but rate exists, derive total so avg is not wiped to 0
+                    if ($lineTotal <= 0 && $purchasePrice > 0 && $receivedQtyRow > 0) {
+                        $lineTotal = $purchasePrice * $receivedQtyRow;
+                    }
+                    $purchaseChilddata->rate = $purchasePrice;
+                    $purchaseChilddata->total = $lineTotal;
                     $purchaseChilddata->remarks = $row['remarks'] ?? '';
                     $purchaseChilddata->save();
                     $purchaseChild_id = $purchaseChilddata->id;
@@ -643,7 +662,7 @@ class PurchaseOrderController extends Controller
                     $itemInventory->expiry_date = $expiryDate;
                     $itemInventory->inventory_type_id = 1;
                     $itemInventory->quantity_in = $row['received_quantity'];
-                    $itemInventory->purchase_price = $row['purchase_price'] ?? 0;
+                    $itemInventory->purchase_price = $purchasePrice;
                     $itemInventory->date = $request->receive_date;
                     $itemInventory->save();
 
@@ -717,21 +736,53 @@ class PurchaseOrderController extends Controller
 
                 $receivedQty = (float) $data['quantity'];
                 $receivedTotal = (float) $data['total'];
+                // Fallback: if child.total is 0 but rate was saved, rebuild value from rate * qty
+                if ($receivedTotal <= 0 && $receivedQty > 0) {
+                    $rateSum = (float) PurchaseOrderChild::where('purchase_order_id', $request->id)
+                        ->where('item_id', $itemId)
+                        ->selectRaw('SUM(rate * received_quantity) as v')
+                        ->value('v');
+                    if ($rateSum > 0) {
+                        $receivedTotal = $rateSum;
+                    }
+                }
 
                 // When current stock is zero: new avg = this receive's unit cost (received total / received qty)
                 if ($currentStock <= 0) {
-                    $newAvgCost = ($receivedQty > 0 && $receivedTotal >= 0)
-                        ? ($receivedTotal / $receivedQty)
-                        : $currentAvgCost;
+                    if ($receivedQty > 0 && $receivedTotal > 0) {
+                        $newAvgCost = $receivedTotal / $receivedQty;
+                    } else {
+                        // Keep previous avg (do not force 0 on free-only / zero-value receive)
+                        $newAvgCost = $currentAvgCost;
+                    }
                 } else {
-                    // Weighted average when we have existing stock
+                    // Weighted average when we have existing stock.
+                    // First receive: oldPOQty is 0, so do not subtract any pre-filled PO total.
+                    // Re-receive: remove previous received contribution, then add the new one.
+                    if ($oldPOQty <= 0) {
+                        $oldPOTotal = 0;
+                    }
                     $stockBeforeThisReceive = $currentStock - $receivedQty + $oldPOQty;
-                    $newTotalValue = $currentAvgCost * $stockBeforeThisReceive - $oldPOTotal + $receivedTotal;
+                    if ($stockBeforeThisReceive < 0) {
+                        $stockBeforeThisReceive = 0;
+                    }
+                    $newTotalValue = ($currentAvgCost * $stockBeforeThisReceive) - $oldPOTotal + $receivedTotal;
+                    if ($newTotalValue < 0) {
+                        $newTotalValue = 0;
+                    }
                     $newStockQty = $currentStock;
-                    $newAvgCost = $newStockQty > 0 ? ($newTotalValue / $newStockQty) : $currentAvgCost;
+                    if ($newStockQty > 0) {
+                        $newAvgCost = $newTotalValue / $newStockQty;
+                    } else {
+                        $newAvgCost = $currentAvgCost;
+                    }
                 }
 
                 $newAvgCost = round((float) $newAvgCost, 2);
+                // Never wipe a known avg to 0 because of a bad/zero receive total
+                if ($newAvgCost <= 0 && $currentAvgCost > 0) {
+                    $newAvgCost = round($currentAvgCost, 2);
+                }
                 DB::update('UPDATE items SET avg_cost = ? WHERE id = ?', [$newAvgCost, $itemId]);
             }
 
@@ -836,22 +887,43 @@ class PurchaseOrderController extends Controller
             // Calculate average cost for grouped items
             foreach ($groupedItems as $itemId => $data) {
                 $item = Item::find($itemId);
-                $currentStock = Item::calculateTotalStockQty($itemId);
-                $currentTotalAmount = $item->avg_cost * $currentStock;
-
-                // Calculate new stock and total cost
-                $newStockQty = $currentStock + $data['quantity'];
-                $newTotalAmount = $currentTotalAmount + $data['total'];
-
-                // Calculate new average cost
-                if ($newStockQty > 0) {
-                    $newAvgCost = $newTotalAmount / $newStockQty;
-                } else {
-                    $newAvgCost = 0;
+                if (!$item) {
+                    continue;
+                }
+                $currentStock = (float) Item::calculateTotalStockQty($itemId);
+                $currentAvgCost = (float) ($item->avg_cost ?? 0);
+                $receivedQty = (float) $data['quantity'];
+                $receivedTotal = (float) $data['total'];
+                if ($receivedTotal <= 0 && $receivedQty > 0) {
+                    // rebuild from request rows for this item if amount was missing
+                    foreach ($request->childArray as $row) {
+                        if ((int) $row['item_id'] === (int) $itemId) {
+                            $p = (float) ($row['purchase_price'] ?? 0);
+                            $q = (float) ($row['received_quantity'] ?? 0);
+                            if ($p > 0 && $q > 0) {
+                                $receivedTotal += $p * $q;
+                            }
+                        }
+                    }
                 }
 
-                // Update the item's average cost
-                $item->avg_cost = $newAvgCost;
+                $newStockQty = $currentStock + $receivedQty;
+                $newTotalAmount = ($currentAvgCost * $currentStock) + $receivedTotal;
+
+                if ($newStockQty > 0 && $newTotalAmount > 0) {
+                    $newAvgCost = $newTotalAmount / $newStockQty;
+                } elseif ($receivedQty > 0 && $receivedTotal > 0) {
+                    $newAvgCost = $receivedTotal / $receivedQty;
+                } else {
+                    // Never force avg to 0 on empty/zero-value receive
+                    $newAvgCost = $currentAvgCost;
+                }
+
+                if ($newAvgCost <= 0 && $currentAvgCost > 0) {
+                    $newAvgCost = $currentAvgCost;
+                }
+
+                $item->avg_cost = round((float) $newAvgCost, 2);
                 $item->save();
             }
 
@@ -1810,11 +1882,11 @@ class PurchaseOrderController extends Controller
                     // Reverse old PO quantities and add new ones
                     $newStockQty = $currentStock + $quantityToAdd - $totalQtyPurchaseOrder;
 
-                    // Prevent division by zero
-                    if ($newStockQty <= 0) {
-                        $newAvgCost = 0;
-                    } else {
+                    // Keep previous avg when stock/value cannot produce a valid new avg
+                    if ($newStockQty > 0 && $newTotalAmount > 0) {
                         $newAvgCost = $newTotalAmount / $newStockQty;
+                    } else {
+                        $newAvgCost = (float) $item->avg_cost;
                     }
 
                     Log::info("Calculated new values for item_id: $itemId", [
@@ -1823,6 +1895,9 @@ class PurchaseOrderController extends Controller
                         'newAvgCost' => $newAvgCost,
                     ]);
 
+                    if ($newAvgCost <= 0 && (float) $item->avg_cost > 0) {
+                        $newAvgCost = (float) $item->avg_cost;
+                    }
                     $item->avg_cost = round($newAvgCost, 2);
                     $item->save();
                 }
@@ -1837,13 +1912,16 @@ class PurchaseOrderController extends Controller
 
                     Log::info("Debugging AvgCost Calculation for item_id: $itemId", $rowsArray);
 
-                    $newTotalAmount = $totalToAdd;
-                    $newStockQty = $quantityToAdd;
-                    $newAvgCost = $newTotalAmount / $newStockQty;
+                    if ($totalToAdd > 0) {
+                        $newAvgCost = $totalToAdd / $quantityToAdd;
+                    } else {
+                        // Free/zero-value first stock-in: do not set avg to 0
+                        $newAvgCost = (float) $item->avg_cost;
+                    }
 
                     Log::info("Final calculated values for item_id: $itemId", [
-                        'newTotalAmount' => $newTotalAmount,
-                        'newStockQty' => $newStockQty,
+                        'newTotalAmount' => $totalToAdd,
+                        'newStockQty' => $quantityToAdd,
                         'newAvgCost' => $newAvgCost,
                     ]);
 

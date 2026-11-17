@@ -44,6 +44,7 @@ class salePoController extends Controller
             $po_no = $req->po_no;
             $store_id = $req->store_id;
             $store_type_id = $req->store_type_id;
+            $item_id = $req->item_id;
             $from = $req->from_date;
             $to = $req->to_date;
             $searcField = $req->searcField;
@@ -70,6 +71,11 @@ class salePoController extends Controller
                 })
                 ->when($to, function ($q, $to) {
                     return $q->where('request_date', '<=', $to);
+                })
+                ->when($item_id, function ($query, $item_id) {
+                    $query->whereHas('purchaseorderchild', function ($qu) use ($item_id) {
+                        $qu->where('item_id', $item_id);
+                    });
                 })
                 ->when($searcField, function ($q, $searcField) {
                     return $q->where('remarks', 'LIKE', '%' . $searcField . '%');

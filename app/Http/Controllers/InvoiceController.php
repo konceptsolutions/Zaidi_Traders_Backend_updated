@@ -2630,33 +2630,67 @@ public function getSalesReportManufacturewise(Request $req)
     {
         $sale_type = $req->sale_type;
         $sales_rep_id = $req->sales_rep_id;
+        $customer_id = $req->customer_id;
         $store_id = $req->store_id;
         $from = $req->from_date;
         $to = $req->to_date;
+        $item_ids = $req->item_id; // comma-separated string or array
+        $itemIdList = $item_ids
+            ? (is_array($item_ids) ? $item_ids : array_filter(explode(',', $item_ids)))
+            : [];
+
         try {
-            $invoices = Person::with('salesRepInvoice', 'personType')
-                ->when($from, function ($query, $from) use ($to) {
-                    $query->whereHas('salesRepInvoice', function ($query) use ($from, $to) {
-                        $query->whereBetween('date', [$from, $to]);
+            $invoices = Person::with(['salesRepInvoice' => function ($query) use ($itemIdList, $from, $to, $sale_type, $customer_id) {
+                    $query->with(['invoiceChild' => function ($q) use ($itemIdList) {
+                        $q->when(!empty($itemIdList), function ($q2) use ($itemIdList) {
+                            $q2->whereIn('item_id', $itemIdList);
+                        });
+                    }, 'store', 'customer'])
+                    ->when($from && $to, function ($q) use ($from, $to) {
+                        $q->whereBetween('date', [$from, $to]);
+                    })
+                    ->when($sale_type, function ($q) use ($sale_type) {
+                        $q->where('sale_type', $sale_type);
+                    })
+                    ->when($customer_id, function ($q) use ($customer_id) {
+                        $q->where('customer_id', $customer_id);
+                    })
+                    ->when(!empty($itemIdList), function ($q) use ($itemIdList) {
+                        $q->whereHas('invoiceChild', function ($q2) use ($itemIdList) {
+                            $q2->whereIn('item_id', $itemIdList);
+                        });
+                    });
+                }, 'personType'])
+                ->when($from && $to, function ($query) use ($from, $to) {
+                    $query->whereHas('salesRepInvoice', function ($q) use ($from, $to) {
+                        $q->whereBetween('date', [$from, $to]);
                     });
                 })
                 ->when($sales_rep_id, function ($query, $sales_rep_id) {
                     $query->where('id', $sales_rep_id);
                 })
-
-                ->when($sale_type, function ($query, $sale_type) {
-                    $query->whereHas('salesRepInvoice', function ($query) use ($sale_type) {
-                        $query->where('sale_type', '=', $sale_type);
+                ->when($sale_type, function ($query) use ($sale_type) {
+                    $query->whereHas('salesRepInvoice', function ($q) use ($sale_type) {
+                        $q->where('sale_type', $sale_type);
                     });
                 })
-
-            // ->wherehas('personType', function ($query) use ($store_id) {
-            //     $query->where('id', 4);
-            // })
-
+                ->when(!empty($itemIdList), function ($query) use ($itemIdList, $from, $to, $sale_type) {
+                    $query->whereHas('salesRepInvoice', function ($q) use ($itemIdList, $from, $to, $sale_type) {
+                        $q->when($from && $to, function ($q2) use ($from, $to) {
+                            $q2->whereBetween('date', [$from, $to]);
+                        })
+                        ->when($sale_type, function ($q2) use ($sale_type) {
+                            $q2->where('sale_type', $sale_type);
+                        })
+                        ->whereHas('invoiceChild', function ($q2) use ($itemIdList) {
+                            $q2->whereIn('item_id', $itemIdList);
+                        });
+                    });
+                })
+                ->whereHas('personType', function ($query) {
+                    $query->where('id', 4);
+                })
                 ->get();
-            // $coa_id=CoaAccount::where('')
-            // $coaAccountLedgerBal = CoaAccount::getCoaAccountBal($plot->coa_account_id);
 
             return ['invoices' => $invoices];
         } catch (\Exception $e) {

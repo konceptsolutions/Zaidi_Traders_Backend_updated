@@ -42,6 +42,7 @@ class ReturnPurhaseController extends Controller
             $po_no = $req->po_no;
             $store_id = $req->store_id;
             $store_type_id = $req->store_type_id;
+            $item_id = $req->item_id;
             $received_from = $req->receive_from;
             $received_to = $req->receive_to;
             $from = $req->from_return_date;
@@ -90,6 +91,11 @@ class ReturnPurhaseController extends Controller
                 ->when($received_to, function ($query, $received_to) {
                     $query->whereHas('purchaseorder', function ($qu) use ($received_to) {
                         return $qu->where('receive_date', '<=', $received_to);
+                    });
+                })
+                ->when($item_id, function ($query, $item_id) {
+                    $query->whereHas('pochild', function ($qu) use ($item_id) {
+                        $qu->where('item_id', $item_id);
                     });
                 })
 

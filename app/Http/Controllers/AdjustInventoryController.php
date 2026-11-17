@@ -35,7 +35,27 @@ class AdjustInventoryController extends Controller
             return ['status' => 'error', 'message' => $validator->errors()->first()];
         }
         try {
-            $itemsInventory = AdjustInventory::orderBy($req->colName, $req->sort)
+            $item_id = $req->item_id;
+            $category_id = $req->category_id;
+            $subcategory_id = $req->subcategory_id;
+
+            $itemsInventory = AdjustInventory::query()
+                ->when($item_id, function ($query, $item_id) {
+                    $query->whereHas('adjustInventoryChild', function ($qu) use ($item_id) {
+                        $qu->where('item_id', $item_id);
+                    });
+                })
+                ->when($category_id, function ($query, $category_id) {
+                    $query->whereHas('adjustInventoryChild.item', function ($qu) use ($category_id) {
+                        $qu->where('category_id', $category_id);
+                    });
+                })
+                ->when($subcategory_id, function ($query, $subcategory_id) {
+                    $query->whereHas('adjustInventoryChild.item', function ($qu) use ($subcategory_id) {
+                        $qu->where('subcategory_id', $subcategory_id);
+                    });
+                })
+                ->orderBy($req->colName, $req->sort)
                 ->paginate($req->records, ['*'], 'page', $req->pageNo);
 
             return ['itemsInventory' => $itemsInventory];
